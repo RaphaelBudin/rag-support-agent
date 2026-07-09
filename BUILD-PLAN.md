@@ -13,12 +13,15 @@ Each milestone maps to a design-decision write-up in the README (that's your int
 ## M0 — Skeleton (this scaffold) ✅
 Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
 
-## M1 — Ingestion + knowledge units
-- Loader for the sample docs (markdown/HTML).
-- Chunking with an explicit, defensible strategy (semantic/heading-aware, size + overlap chosen on purpose).
-- **Knowledge unit** = chunk + metadata (source, section, `created_at`, `source_updated_at`, hash).
-- **Write-up:** chunking strategy & why.
-- *Demo:* ingest → rows in Postgres.
+## M1 — Ingestion + knowledge units ✅
+- ✅ Loader for the sample docs (Markdown), capturing source mtime for freshness.
+- ✅ Heading-aware chunking with size+overlap windowing (unit-tested, 4 tests green).
+- ✅ **Knowledge unit** = chunk + metadata (source, section, chunk_index, content_hash, source_updated_at).
+- ✅ Pluggable embedders: `hash` (keyless dev/test) + `openai`; idempotent upsert into pgvector.
+- ✅ Runs end-to-end keyless: `python -m rag_support_agent.ingestion.run --source data/sample_docs --dry-run`
+  → 5 docs → 28 chunks → embedded.
+- ⏳ **Write-up (README design-decisions):** chunking strategy & why — TODO.
+- *Demo:* `docker compose up -d` then ingest (no `--dry-run`) → rows in Postgres.
 
 ## M2 — Retrieval (the core)
 - Embeddings (pluggable provider) → pgvector; cosine top-k.

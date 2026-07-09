@@ -21,6 +21,7 @@ class KnowledgeUnit:
     content: str
     source_uri: str            # where it came from (doc URL, ticket id, ...)
     section: str | None = None
+    chunk_index: int = 0       # position within its source (part of the deterministic id)
     content_hash: str = ""     # dedup + change detection across re-ingests
     created_at: datetime | None = None
     source_updated_at: datetime | None = None  # drives freshness/decay (see knowledge.freshness)

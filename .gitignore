@@ -16,12 +16,9 @@ venv/
 .env.*
 *.secret
 
-# Data / local artifacts (keep sample_docs and eval datasets tracked)
-data/*
-!data/sample_docs/
-data/sample_docs/*
-!data/sample_docs/.gitkeep
-!data/sample_docs/PUT_DOCS_HERE.md
+# Data: ignore locally-ingested corpora, keep the demo corpus tracked
+/data/*
+!/data/sample_docs/
 *.sqlite
 *.db
 

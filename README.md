@@ -72,6 +72,11 @@ python -m rag_support_agent.api.server
 python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl
 ```
 
+> **Runs keyless out of the box.** The default embedder (`EMBEDDING_PROVIDER=hash`) is a
+> deterministic, no-API-key stand-in so you can try the whole flow in minutes; set it to
+> `openai` for real embeddings. Ingestion alone needs no database — try
+> `python -m rag_support_agent.ingestion.run --source data/sample_docs --dry-run`.
+
 ## Evaluation
 
 The point of the eval harness is that these numbers are **reproducible** — run `eval.run` and you get them yourself.
