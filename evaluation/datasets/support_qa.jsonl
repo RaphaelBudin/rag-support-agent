@@ -1,0 +1,3 @@
+{"question": "How do I rotate an API key?", "gold_source": "sample_docs/api-keys.md", "gold_answer": "Go to Settings > API Keys, click Rotate; the old key stays valid for 24h.", "expected_abstain": false}
+{"question": "What does error E_RATE_LIMIT mean and how do I fix it?", "gold_source": "sample_docs/errors.md", "gold_answer": "You exceeded the request quota; back off and retry with exponential backoff, or upgrade the plan.", "expected_abstain": false}
+{"question": "Can I pay in Dogecoin?", "gold_source": null, "gold_answer": null, "expected_abstain": true}

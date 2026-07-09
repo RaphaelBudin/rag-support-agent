@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env / secrets
+.env
+.env.*
+*.secret
+
+# Data / local artifacts (keep sample_docs and eval datasets tracked)
+data/*
+!data/sample_docs/
+data/sample_docs/*
+!data/sample_docs/.gitkeep
+!data/sample_docs/PUT_DOCS_HERE.md
+*.sqlite
+*.db
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
