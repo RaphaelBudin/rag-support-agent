@@ -64,11 +64,14 @@ uv sync            # or: pip install -e .
 # 3. Ingest the sample docs
 python -m rag_support_agent.ingestion.run --source data/sample_docs
 
-# 4. Run the API + UI
+# 4. Query it — hybrid retrieval with per-arm scores (M2)
+python -m rag_support_agent.retrieval.search --query "401 Unauthorized error" --show-arms
+
+# 6. Run the API + UI  (M3/M8 — not built yet)
 python -m rag_support_agent.api.server
 # open http://localhost:8000
 
-# 5. Run the eval harness
+# 7. Run the eval harness  (M5 — not built yet)
 python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl
 ```
 
@@ -128,7 +131,68 @@ thin vectors — fine for keyword/BM25, weaker for dense semantic match. If sect
 routinely tiny I'd merge adjacent small siblings under the same parent heading up to a
 floor size. This corpus doesn't need it; a larger one might.
 
-### Why hybrid retrieval over pure vector — _tbd (M2)_
+### Why hybrid retrieval over pure vector
+
+**Decision.** Run two retrievers — dense (pgvector cosine over embeddings) and sparse
+(BM25 keyword) — fuse them with Reciprocal Rank Fusion, then apply a relevance gate.
+Not vector-only.
+
+**Why.** Support questions mix two things that reward *opposite* retrievers:
+- **Exact tokens** — error codes (`E_RATE_LIMIT`), status codes (`401`), key prefixes
+  (`ak_test_`), header names (`Retry-After`). Embeddings blur these into a neighborhood;
+  BM25, with IDF weighting, treats a rare exact token as a strong, precise signal.
+- **Paraphrase** — "how do I stop a leaked key from working" for a section titled
+  *Revoking a key*, sharing no keywords. BM25 scores ~0 here; a semantic embedding scores
+  high.
+
+No single retriever is good at both, and which one a query needs isn't known in advance.
+So run both and fuse.
+
+**Why RRF and not a weighted score blend.** Cosine similarity sits in ~[0,1]; BM25 scores
+are unbounded and corpus-dependent. Blending them means normalizing incomparable scales
+and picking a weight that's really query-dependent. RRF sidesteps that: it fuses on
+**rank** (`score = Σ 1/(k + rank)`, k=60), so there's no normalization and no weight to
+tune. It's the boring, robust default — and it's unit-tested (`tests/test_fusion.py`).
+
+**The relevance gate.** After fusion, a candidate survives only if the dense arm clears an
+absolute cosine floor **or** the sparse arm has any keyword hit. Failing both means
+out-of-scope, so the query surfaces *nothing* — which is what lets the agent abstain (M4)
+instead of returning its least-bad guess. The gate is a coarse pre-filter; calibrated
+abstention (score spread + grounding) is a separate, later threshold.
+
+**What I measured** — reproducible, keyless (`EMBEDDING_PROVIDER=hash`, zero setup):
+
+1. **BM25 recovers a relevant source that pure vector discards.** For `"401 Unauthorized
+   error"`, the chunk `api-keys.md > Revoking a key` (a revoked key fails with `401
+   Unauthorized` / `E_AUTH_INVALID`) scores dense cosine **0.140 — below the 0.15 gate**,
+   so vector-only-plus-gate drops it. BM25 ranks it **#2** on the exact `401` /
+   `E_AUTH_INVALID` match, and fusion returns it at **#4**. Hybrid keeps a correct source
+   that vector alone threw away.
+2. **The gate abstains on out-of-scope.** For `"how do I bake sourdough bread"`, BM25
+   returns nothing (no keyword overlap) and the best dense cosine is **0.064**, far under
+   the floor — the gate returns **empty**. No hallucinated "closest" source.
+
+```
+python -m rag_support_agent.retrieval.search --query "401 Unauthorized error" --show-arms
+```
+
+**Honest limitation of the keyless demo.** The default `hash` embedder is *lexical*
+(feature-hashing of tokens), not semantic — so keyless, the dense arm and BM25 largely
+**agree**, and fusion barely reorders them. Hybrid's bigger payoff, recovering pure
+*paraphrases* that share no keywords with the query, needs a real embedder. The harness
+supports it; reproduce with your own key:
+```
+EMBEDDING_PROVIDER=openai python -m rag_support_agent.ingestion.run --source data/sample_docs
+EMBEDDING_PROVIDER=openai python -m rag_support_agent.retrieval.search \
+  --query "how do I make a leaked credential stop working immediately" --show-arms
+```
+
+**Also fixed here, found via this measurement.** The dense arm first embedded only the
+chunk *body*, so a chunk whose error code lives in its *heading* (`... > E_RATE_LIMIT
+(429)`) was near-invisible to vector search — it sat at dense rank **14**. Ingestion now
+embeds the heading path together with the body (the stored/cited text stays the pure
+body); the same chunk moves to rank **3**. Lesson: embed your headings — they're the
+strongest topic label a chunk has.
 ### Confidence signal: how it's computed and calibrated — _tbd (M4)_
 ### Knowledge decay: modeling staleness without ground truth — _tbd (M6)_
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_

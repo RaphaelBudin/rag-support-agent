@@ -14,6 +14,8 @@ venv/
 # Env / secrets
 .env
 .env.*
+# keep the template (no secrets) so the repo runs for a stranger
+!.env.example
 *.secret
 
 # Data: ignore locally-ingested corpora, keep the demo corpus tracked

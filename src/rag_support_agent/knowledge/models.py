@@ -29,6 +29,25 @@ class KnowledgeUnit:
     metadata: dict = field(default_factory=dict)
 
 
+@dataclass
+class RetrievalResult:
+    """One retrieved unit with its ranking signal and the raw component scores.
+
+    ``score`` is the fused Reciprocal Rank Fusion score (the ranking signal). The
+    component fields are kept alongside it on purpose: RRF throws away magnitude, but
+    the relevance gate (here) and the confidence layer (M4) still need the absolute,
+    interpretable dense similarity and the raw BM25 score. ``None`` means that arm did
+    not return this unit in its candidate pool.
+    """
+
+    unit: KnowledgeUnit
+    score: float                          # fused RRF score
+    dense_similarity: float | None = None  # cosine similarity, ~[0,1], absolute
+    sparse_score: float | None = None      # BM25 score (corpus-dependent scale)
+    dense_rank: int | None = None          # 1-based rank in the dense arm
+    sparse_rank: int | None = None         # 1-based rank in the sparse arm
+
+
 class AnswerVerdict(str, Enum):
     ANSWERED = "answered"
     ABSTAINED = "abstained"    # confidence below threshold — see generation.answer

@@ -53,8 +53,13 @@ def main() -> None:
     n_docs = len({u.source_uri for u in units})
     print(f"[ingest] {n_docs} docs -> {len(units)} chunks")
 
+    # Embed the heading path *with* the body. The heading ("... > Rotating a key") is
+    # the strongest topic label a chunk has, and a chunk whose error code lives only in
+    # its heading would otherwise be near-invisible to dense search. The stored/cited
+    # content stays the pure body — only the embedding input is augmented.
     embedder = get_embedder(settings)
-    vectors = embedder.embed([u.content for u in units])
+    embed_inputs = [f"{u.section}\n\n{u.content}" if u.section else u.content for u in units]
+    vectors = embedder.embed(embed_inputs)
     for unit, vec in zip(units, vectors):
         unit.embedding = vec
     print(f"[ingest] embedded with provider={settings.embedding_provider} dim={embedder.dim}")

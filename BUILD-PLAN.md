@@ -23,12 +23,20 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
 - ✅ **Write-up (README design-decisions):** chunking strategy & why.
 - *Demo:* `docker compose up -d` then ingest (no `--dry-run`) → rows in Postgres.
 
-## M2 — Retrieval (the core)
-- Embeddings (pluggable provider) → pgvector; cosine top-k.
-- Add **BM25 keyword** search; **fuse** (reciprocal rank fusion) → hybrid.
-- Relevance gate: drop weak matches before generation.
-- **Write-up:** why hybrid beats pure vector (error codes, exact API names).
-- *Demo:* query → ranked sources with scores.
+## M2 — Retrieval (the core) ✅
+- ✅ Dense: pgvector cosine top-k (`<=>`, matches the HNSW `vector_cosine_ops` index);
+  query embedded with the same provider as ingest; heading path folded into the embedding.
+- ✅ Sparse: **BM25** (`rank-bm25`) with an error-code-preserving tokenizer + stopword removal.
+- ✅ **Fuse** with reciprocal rank fusion (rank-based → no score normalization / weight tuning).
+- ✅ Relevance gate: keep only if dense clears a cosine floor OR sparse has a keyword hit;
+  out-of-scope → empty (feeds M4 abstention).
+- ✅ Demo CLI `retrieval.search --query ... --show-arms` (hybrid + per-arm breakdown).
+- ✅ Unit tests for fusion / tokenizer / gate (DB-free): `tests/test_fusion.py`.
+- ✅ **Write-up:** "Why hybrid retrieval over pure vector" — two reproducible keyless
+  measurements (BM25 recovers a source vector's gate dropped; gate abstains on out-of-scope).
+- ⏳ Semantic/paraphrase half of the write-up needs a real embedder (no OpenAI key in this
+  env). Reproduce recipe is in the README; drop in numbers when a key is available.
+- *Demo:* `retrieval.search --query "401 Unauthorized error" --show-arms`.
 
 ## M3 — Generation + citations
 - Answer synthesis grounded strictly in retrieved context, with inline **citations**.
