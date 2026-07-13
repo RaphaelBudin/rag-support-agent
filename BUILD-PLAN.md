@@ -59,12 +59,22 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
   (`"How do I get started?"`); confirmed under Gemini where the signal separates cleanly.
 - Threshold *calibration* against the labeled set (abstention precision/recall) is **M5**.
 
-## M5 — Evaluation harness (the differentiator)
-- Labeled Q/A set in `evaluation/datasets/` (gold question → gold source → gold answer).
-- Metrics: Recall@k, answer faithfulness (grounded?), abstention precision, latency, cost.
-- One command → the numbers in the README table.
-- **Write-up:** how you measure faithfulness without a human in the loop.
-- *Demo:* `eval.run` prints the table.
+## M5 — Evaluation harness (the differentiator) ✅
+- ✅ Labeled Q/A set in `evaluation/datasets/` — 23 cases across 4 classes (answerable,
+  ambiguous, out-of-scope, on-topic-but-unanswerable), gold source + gold answer +
+  `expected_abstain`. Clean-room: only the synthetic 5-doc / 28-chunk domain.
+- ✅ Metrics: Recall@k, answer faithfulness (LLM-judge entailment), abstention
+  **precision *and* recall**, p50/p95 latency, approximate cost/1k. Pure, unit-tested
+  (`tests/test_eval.py`); an instrumented runner pinned to `build_answer`'s verdict.
+- ✅ One command → the README table (`python -m rag_support_agent.eval.run --dataset ...`),
+  with `--calibrate` for the threshold sweep. Keyless subset vs. Gemini-gated full suite,
+  same auto-detect pattern as M2/M4.
+- ✅ **Threshold calibration** (the fil rouge from M4): the sweep *validates* the provisional
+  `0.12` — F1 peaks (77.8%) across τ∈[0.10, 0.15]; under `hash` the curve is flat (signal
+  muted), exactly M4's honest limit now shown as a measured curve.
+- ✅ **Write-up:** measuring faithfulness without a human (claim-level LLM-judge entailment;
+  the judge never sees the question — faithfulness ≠ correctness) + the calibration curve.
+- *Demo:* `eval.run` prints the table; `--calibrate` prints the precision/recall curve.
 
 ## M6 — Knowledge freshness / decay
 - Score staleness from source age + update signals; surface a "possibly stale" flag on answers.

@@ -77,8 +77,12 @@ LLM_PROVIDER=gemini python -m rag_support_agent.generation.ask --query "How do I
 python -m rag_support_agent.api.server
 # open http://localhost:8000
 
-# 7. Run the eval harness  (M5 — not built yet)
-python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl
+# 7. Run the eval harness  (M5) — one command → the metrics table
+python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl --calibrate
+# semantic retrieval + LLM-judged faithfulness (needs GEMINI_API_KEY + a Gemini-embedded DB):
+EMBEDDING_PROVIDER=gemini python -m rag_support_agent.ingestion.run --source data/sample_docs
+EMBEDDING_PROVIDER=gemini LLM_PROVIDER=gemini \
+  python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl --calibrate
 ```
 
 > **Runs keyless out of the box.** Both the default embedder (`EMBEDDING_PROVIDER=hash`) and
@@ -90,17 +94,37 @@ python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.js
 
 ## Evaluation
 
-The point of the eval harness is that these numbers are **reproducible** — run `eval.run` and you get them yourself.
+The point of the eval harness is that these numbers are **reproducible** — run `eval.run` and
+you get them yourself. Two columns, because half the story is *which* metrics need a key: the
+**keyless** column runs with zero setup (`EMBEDDING_PROVIDER=hash`, no API key); the
+**semantic** column swaps in real Gemini embeddings, where the confidence signal comes alive
+(as M2/M4 predicted). Measured on the 23-case labeled set at `confidence_abstain_threshold=0.12`.
 
-| Metric | Score | Notes |
-|---|---|---|
-| Retrieval Recall@5 | _tbd_ | fraction of questions whose gold source is in top-5 |
-| Answer faithfulness | _tbd_ | % of answers grounded in retrieved context (no hallucination) |
-| Abstention precision | _tbd_ | when it says "I don't know", it should be right to |
-| p95 latency | _tbd_ | end-to-end |
-| Cost / 1k queries | _tbd_ | |
+| Metric | Keyless (`hash`) | Semantic (Gemini embed) | What it means |
+|---|---|---|---|
+| Retrieval Recall@5 | 94.1% (16/17) | **100% (17/17)** | gold source is in the top-5 retrieved |
+| Answer faithfulness | 100% *by construction* | _pending_ ¹ | % of answers with zero unsupported claims (LLM-judged) |
+| Abstention precision | 62.5% | **70.0% (7/10)** | when it abstains, it should be right to |
+| Abstention recall | 62.5% | **87.5% (7/8)** | of the questions that should abstain, how many did |
+| p50 / p95 latency | ~30 / ~50 ms | ~480 / ~1170 ms | end-to-end, machine-dependent — semantic pays a per-query embed round-trip |
+| Cost / 1k queries | $0 | ~$0.39 ² | approximate serving cost |
 
-_(Filled in as the build progresses — see [BUILD-PLAN.md](BUILD-PLAN.md).)_
+¹ Faithfulness needs the Gemini *generator* (the judge grades generated answers). It is fully
+built and unit-tested, but the number is pending a run: the free-tier key hit its daily
+generation cap (`generate_content`, 20/day). One command fills it once the key is on a paid
+tier: `EMBEDDING_PROVIDER=gemini LLM_PROVIDER=gemini python -m rag_support_agent.eval.run
+--dataset evaluation/datasets/support_qa.jsonl`. Keyless, faithfulness is 100% *by
+construction* — the extractive generator echoes retrieved text verbatim, so there is nothing to
+hallucinate (reported, not judged).
+² Approximate: from M3's measured Gemini token counts (~450 in / ~100 out per query) × Gemini
+2.5 Flash list price ($0.30 / $2.50 per 1M in/out). Real per-request cost accounting is M7.
+
+**Calibration (the fil rouge from M4).** M4 shipped `0.12` as a provisional cut; `--calibrate`
+sweeps it. Under the semantic embedder, abstention **F1 peaks at 77.8% across τ∈[0.10, 0.15] —
+`0.12` sits in that band**, so the guess holds up. Under `hash` the curve is flat (the lexical
+signal is muted, exactly M4's honest limit) — now shown as a measured curve, not asserted.
+
+_(See [BUILD-PLAN.md](BUILD-PLAN.md) for the milestone map.)_
 
 ---
 
@@ -373,6 +397,85 @@ no field to stand out from) and is abstained conservatively — a genuinely uniq
 refused, a deliberate trade to never claim false confidence from a single incidental hit. And
 the honest limit above stands: under a purely lexical embedder the signal is too weak to
 trust — confidence-calibrated abstention wants a semantic embedder underneath it.
+
+### Evaluation harness: measuring faithfulness without a human, and calibrating abstention
+
+**Decision.** One command (`eval.run`) takes the labeled set end-to-end through the *real*
+pipeline and prints the metrics table — Recall@k, abstention precision *and* recall, latency,
+cost, and answer **faithfulness**. Faithfulness is measured with an **LLM-as-judge doing
+claim-level entailment**, not a human and not a holistic score. The abstention threshold from
+M4 is **calibrated** here against the same set.
+
+**How faithfulness is measured without a human — and why this shape.** For every answered
+question the judge is handed the retrieved **context** and the **answer**, and asked to split
+the answer into atomic claims and label each `SUPPORTED` / `NOT_SUPPORTED` *against the context
+only*. Three deliberate choices make the number mean something:
+
+- **Claim-level, not a 1–5 "is this grounded".** A holistic score rewards fluent, plausible
+  prose; per-claim entailment forces the judge to find evidence for each assertion, and the
+  metric (share of answers with **zero** unsupported claims) is the one a support team actually
+  cares about — *one* invented sentence is the failure.
+- **The judge never sees the question.** This is the crux: **faithfulness ≠ correctness.** We
+  are not asking "is this the right answer" but "is every sentence traceable to the supplied
+  passages." Withholding the question (and forbidding outside knowledge) stops the judge from
+  rewarding a claim that is *true in the world* but *absent from the context* — which is exactly
+  the parametric-memory leak grounding exists to prevent.
+- **It is the M4 hook, realized.** M4 left `generation.answer._grounding_factor` pluggable — an
+  optional LLM self-eval scoring entailment of the draft. This *is* that primitive, run as an
+  eval-time measurement; the identical call can later become the online `<1.0` grounding factor.
+
+Faithfulness is therefore **Gemini-gated**, and the harness says so: keyless, the extractive
+generator is grounded *by construction* (it echoes retrieved text verbatim, so there is nothing
+to hallucinate) — reported as 100%-by-construction, not judged, because judging a tautology
+just costs tokens. Recall, abstention, and latency all run keyless and reproducible.
+
+**Challenge — the harness must not silently re-implement the pipeline.** To calibrate the
+threshold I need each answer's *intermediate* signals (which abstention layer fired, the raw
+confidence, the context the generator saw) — things `build_answer` collapses into a verdict. So
+the harness has an instrumented runner that exposes them. The risk: it drifts from
+`build_answer` and the reported numbers describe a *different* pipeline than the one that ships.
+The fix is a consistency test (`tests/test_eval.py`) that pins the runner's verdict to
+`build_answer`'s on the same inputs — they cannot diverge without a red test. The pure metric
+functions are unit-tested the same way; an eval harness whose metrics are wrong is worse than
+none.
+
+**What I measured — the threshold calibration (semantic embedder, `--calibrate`).** M4's `0.12`
+was a provisional cut; the sweep re-tallies abstention precision/recall at every threshold
+(free — every record already carries its reason + confidence, so no re-retrieval, no LLM).
+Abstention **F1 peaks at 77.8% across τ∈[0.10, 0.15], and `0.12` sits in that band** — the M4
+guess is validated, not re-asserted. The harness deliberately does **not** chase full recall:
+one stubborn should-abstain case only gets caught at τ≥0.26, and pushing the threshold there
+collapses precision to 42% and answers just **4 of 23** — over-abstention to catch one outlier.
+Under `hash` the curve is flat (the lexical signal is muted, exactly M4's honest limit).
+
+**What I measured — the layers cover each other's blind spots.** At `0.12` the single
+answered-but-should-have-abstained case is *"what is the exact per-call overage rate in USD?"*
+(confidence **0.260** — `billing.md` is a clear retrieval winner, so spread is high — but the
+number is "on the pricing page", absent from the context). Confidence (Layer 3) *cannot* catch
+this: retrieval genuinely has a clear winner. The **Gemini sentinel (Layer 2)** is exactly what
+does — an on-topic-but-unanswerable refusal — which is why that layer earns its keep. And the
+three over-abstentions are paraphrases whose home doc has several co-relevant sections (e.g. the
+leaked-key question pulling multiple `api-keys.md` sections): the source *is* retrieved
+(Recall@5 = 100%) yet the field is flat, so spread stays low. Honest cost of a
+"clear-winner" signal.
+
+**What I measured — the semantic-retrieval win, as a delta.** The labeled *"Can I pay in
+Dogecoin?"* is answerable — `billing.md` says "we do not accept cryptocurrency" — so it is
+labeled `expected_abstain: false, gold_source: billing.md` (a labeling bug fixed in M5). Under
+`hash` it is the **one** Recall@5 miss (94.1%): lexical retrieval can't bridge
+*dogecoin → cryptocurrency*. Under the semantic embedder it retrieves `billing.md` and answers
+(Recall@5 = **100%**, confidence 0.172). A relabel turned into a measured argument for why
+semantic retrieval is in the stack.
+
+**Trade-off / what breaks.** N = 23 is small — the calibration *method* and the shape of the
+curve are the deliverable, not the second decimal of a threshold; a production set would be
+hundreds of labeled tickets. The judge is itself an LLM, and Gemini judging Gemini risks
+*correlated error* (a model rating its own phrasing as grounded); it is mitigated by the judge's
+task being far narrower than generation (entailment over given text, temperature 0, strict
+rubric), and a cross-family judge is the clean next step. Finally the harness is **quota-aware**
+— it paces and backs off on a per-minute limit but *fails fast* on a spent daily bucket (keying
+off the server's `retryDelay` magnitude, not the quota label), so a run dies in seconds with
+guidance instead of burning minutes to fail.
 
 ### Knowledge decay: modeling staleness without ground truth — _tbd (M6)_
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_

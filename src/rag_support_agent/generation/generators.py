@@ -141,6 +141,11 @@ class GeminiGenerator:
         self.model = model
         self.temperature = temperature
         self._client = genai.Client(api_key=api_key)
+        # Token counts from the most recent call. The eval harness reads these to estimate
+        # serving cost (M5); plain ints so this module never imports the eval package.
+        # NOT the production cost path — persisting cost onto Answer.cost_usd is M7.
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
 
     def generate(self, query: str, results: list[RetrievalResult]) -> GenResult:
         from google.genai import types
@@ -157,6 +162,8 @@ class GeminiGenerator:
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
+        self.last_input_tokens = getattr(resp.usage_metadata, "prompt_token_count", 0) or 0
+        self.last_output_tokens = getattr(resp.usage_metadata, "candidates_token_count", 0) or 0
         text = (resp.text or "").strip()
         # Empty output or the refusal sentinel => the model declined to answer from context.
         if not text or text.startswith(SENTINEL):
