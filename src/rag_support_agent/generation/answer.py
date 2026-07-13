@@ -1,10 +1,10 @@
-"""Answer generation with grounding, citations, and (grounding-only) abstention.
+"""Answer generation with grounding, citations, and confidence-based abstention.
 
 The agent answers ONLY from retrieved context — never from parametric memory — attaches
 citations, and abstains rather than guess. One confident hallucination costs more trust
 than ten honest "I don't know"s.
 
-Grounding is enforced in two independent layers:
+Grounding is enforced in two independent layers (M3):
 
   1. Structural (provider-independent, un-foolable): if the M2 relevance gate returns
      nothing, the query is out of scope, so we never even call a generator — we abstain.
@@ -16,9 +16,16 @@ Grounding is enforced in two independent layers:
 and it produces an ``Answer`` with no database in the loop (see ``tests/test_generation``).
 ``answer_question`` is the thin DB-backed wrapper that supplies real retrieval.
 
-M4 boundary: abstention here is *grounding-only* (empty retrieval or generator refusal).
-Calibrated, confidence-threshold abstention is M4 — so ``compute_confidence`` stays a stub
-and ``Answer.confidence`` is a documented placeholder that nothing yet acts on.
+Abstention now has *three* independent layers (Layers 1–2 are M3 grounding, Layer 3 is M4):
+
+  3. Confidence (M4): retrieval brought something back AND the generator answered, but the
+     top hit doesn't stand out from the field — an ambiguous, no-clear-winner retrieval. We
+     compute a confidence *spread* signal and abstain below ``confidence_abstain_threshold``,
+     pointing at the closest source rather than the "nothing here" of the structural refusal.
+
+M4/M5 boundary: M4 computes the signal, wires *one* defensible threshold, and adds the third
+abstention. Calibrating that threshold against the labeled eval set (abstention
+precision/recall) — and the optional LLM self-eval grounding factor — is M5.
 """
 
 from __future__ import annotations
@@ -31,7 +38,6 @@ from rag_support_agent.knowledge.models import (
     Answer,
     AnswerVerdict,
     Citation,
-    KnowledgeUnit,
     RetrievalResult,
 )
 from rag_support_agent.retrieval.hybrid import retrieve
@@ -43,46 +49,102 @@ NO_SOURCE_MESSAGE = (
 )
 
 
-def compute_confidence(query: str, retrieved: list[tuple[KnowledgeUnit, float]]) -> float:
-    """Confidence in [0,1] from retrieval score spread + grounding check.
+def _retrieval_spread(results: list[RetrievalResult]) -> float:
+    """Separation of the top hit from the field, on dense cosine similarity, in [0,1].
 
-    Signals to combine (M4):
-      - top score and gap to the next result (a clear winner => higher confidence)
-      - whether the drafted answer is entailed by the retrieved context
-      - optional lightweight self-eval
+    ``spread = (d_top - mean(dense of the other results)) / d_top`` (clamped to [0,1]).
+    A clear winner — top cosine well above the pack — scores high; a flat field of
+    near-ties (ambiguous *or* out-of-scope) scores ~0. It is deliberately a *relative*
+    signal: the fused RRF score is rank-based and magnitude-blind (it reads ~0.033 vs
+    ~0.032 even for an obvious answer), and an absolute cosine floor doesn't transfer
+    across embedders (M2), whereas this top-vs-field gap does.
+
+    Keyed off the *fused winner* (``results[0]``) — the passage we would actually serve —
+    not the max-dense passage in the set. Needs ≥2 results carrying a dense similarity: a
+    lone gated hit has no field to stand out from, so a winner cannot be established and we
+    return 0.0 (abstain conservatively) rather than claim false confidence.
     """
-    raise NotImplementedError
+    if len(results) < 2:
+        return 0.0
+    d_top = results[0].dense_similarity
+    if d_top is None or d_top <= 0:
+        return 0.0
+    field = [r.dense_similarity for r in results[1:] if r.dense_similarity is not None]
+    if not field:
+        return 0.0
+    spread = (d_top - sum(field) / len(field)) / d_top
+    return max(0.0, min(1.0, spread))
 
 
-def _placeholder_confidence(results: list[RetrievalResult]) -> float:
-    """M3 placeholder: the top result's fused RRF score.
+def _grounding_factor() -> float:
+    """Grounding component of confidence, in [0,1].
 
-    Deliberately trivial and *not* consumed by any decision in M3 — abstention here keys
-    off retrieval/grounding, never off this number. M4 replaces it with a calibrated signal
-    (score spread + grounding) via ``compute_confidence``.
+    Spread answers "is there a clear winner"; grounding answers "is the drafted answer
+    actually supported by that winner". For *both* shipped generators this is 1.0 by
+    design: ``ExtractiveGenerator`` echoes retrieved text verbatim (grounded by
+    construction), and ``GeminiGenerator`` is constrained to the numbered context and
+    emits the sentinel otherwise (caught as Layer-2 abstention before we get here). The
+    optional M4 enhancement — an LLM self-eval scoring entailment of the draft by its
+    cited context — plugs in *here* as a <1.0 factor for the gemini path; it stays off by
+    default so the pipeline needs no API key. Measured faithfulness becomes a number in M5.
     """
-    return results[0].score if results else 0.0
+    return 1.0
 
 
-def _abstain(text: str, latency_ms: float | None = None) -> Answer:
+def compute_confidence(query: str, results: list[RetrievalResult]) -> float:
+    """Confidence in [0,1] that the retrieved context yields a trustworthy answer.
+
+    ``confidence = retrieval_spread × grounding_factor``. The backbone is the *spread* of
+    the top hit over the field (see ``_retrieval_spread``); ``grounding_factor`` is 1.0 for
+    the shipped generators (see ``_grounding_factor``). ``query`` is unused today — it is
+    the hook the optional gemini self-eval would key off (query + draft → entailment).
+    """
+    return _retrieval_spread(results) * _grounding_factor()
+
+
+def _closest_source(result: RetrievalResult) -> str:
+    label = result.unit.source_uri
+    if result.unit.section:
+        label = f"{label} :: {result.unit.section}"
+    return label
+
+
+def _low_confidence_message(results: list[RetrievalResult]) -> str:
+    """Layer-3 refusal: unlike the structural "nothing here", point at the closest source."""
+    return (
+        "I don't have a confident answer for that — the retrieved passages are too "
+        "ambiguous, with no clear best match. The closest source is "
+        f"{_closest_source(results[0])}; check it directly or try rephrasing the question."
+    )
+
+
+def _abstain(
+    text: str, latency_ms: float | None = None, confidence: float = 0.0
+) -> Answer:
     return Answer(
         verdict=AnswerVerdict.ABSTAINED,
         text=text,
-        confidence=0.0,
+        confidence=confidence,
         citations=[],
         latency_ms=latency_ms,
     )
 
 
 def build_answer(
-    query: str, results: list[RetrievalResult], generator: Generator
+    query: str,
+    results: list[RetrievalResult],
+    generator: Generator,
+    settings: Settings | None = None,
 ) -> Answer:
     """Turn retrieved results + a generator into a grounded, cited ``Answer``. Pure (no DB).
 
     Layer 1 — structural grounding: empty ``results`` means the gate found nothing in
     scope, so we abstain without calling the generator (no chance to invent an answer).
-    Otherwise we synthesize, then build the citation list from the ``[n]`` markers the
-    generator actually used — so a citation always points at a passage that was really cited.
+    Otherwise we synthesize; Layer 2 catches a generator refusal. Then Layer 3 (M4): even a
+    fully-formed answer is withheld if confidence (retrieval spread) is below threshold —
+    an ambiguous retrieval with no clear winner. Only past all three do we build the
+    citation list from the ``[n]`` markers the generator actually used, so a citation always
+    points at a passage that was really cited.
     """
     if not results:
         return _abstain(NO_SOURCE_MESSAGE)
@@ -94,6 +156,13 @@ def build_answer(
     # Layer 2 — synthesis grounding: the generator refused (context insufficient).
     if gen.abstained:
         return _abstain(gen.text, latency_ms)
+
+    # Layer 3 — confidence (M4): the answer exists but the retrieval was ambiguous. Abstain
+    # below threshold, surfacing the actual (low) confidence and the closest source.
+    confidence = compute_confidence(query, results)
+    threshold = (settings or get_settings()).confidence_abstain_threshold
+    if confidence < threshold:
+        return _abstain(_low_confidence_message(results), latency_ms, confidence)
 
     # Ascending marker order for the citation list (footnote convention); each Citation
     # keeps its true marker so [4] in the prose renders as [4] in the list, not [2].
@@ -110,7 +179,7 @@ def build_answer(
     return Answer(
         verdict=AnswerVerdict.ANSWERED,
         text=gen.text,
-        confidence=_placeholder_confidence(results),
+        confidence=confidence,
         citations=citations,
         latency_ms=latency_ms,
     )
@@ -131,4 +200,4 @@ def answer_question(
     s = settings or get_settings()
     results = retrieve(query, top_k=top_k, settings=s)
     gen = generator or get_generator(s)
-    return build_answer(query, results, gen)
+    return build_answer(query, results, gen, settings=s)

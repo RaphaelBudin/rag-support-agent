@@ -35,7 +35,12 @@ class Settings(BaseSettings):
 
     # Behavior.
     retrieval_top_k: int = 5
-    confidence_abstain_threshold: float = 0.55
+    # M4 abstention: below this confidence the agent abstains instead of answering.
+    # Confidence is a retrieval *spread* (top-hit gap over the field) in ~[0, 0.3], NOT a
+    # cosine floor — so the threshold lives on that spread scale. 0.12 is the measured
+    # CLEAR/ambiguous boundary under a semantic embedder; provisional — M5 calibrates it
+    # against the labeled eval set (abstention precision/recall).
+    confidence_abstain_threshold: float = 0.12
 
     # Retrieval fusion + gate (M2).
     rrf_k: int = 60  # Reciprocal Rank Fusion constant; larger => flatter rank weighting.

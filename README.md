@@ -300,7 +300,80 @@ faithfulness — that becomes a measured number in M5, and confidence-calibrated
 M4. `Answer.confidence` here is a deliberate placeholder (the top RRF score) that **no
 decision reads yet**; M3 abstention keys only off retrieval and grounding.
 
-### Confidence signal: how it's computed and calibrated — _tbd (M4)_
+### Confidence signal: how it's computed and calibrated
+
+**Decision.** Score each answer with a confidence in `[0,1]` and abstain below a threshold —
+a *third* abstention path on top of M3's two. Confidence is
+`retrieval_spread × grounding_factor`. The backbone, `retrieval_spread`, is how far the top
+hit stands above the field on **dense cosine similarity**:
+`(d_top − mean(d_of_the_rest)) / d_top`. A clear winner scores high; a flat field of
+near-ties scores ~0. When it's below `confidence_abstain_threshold`, the agent abstains and
+**points at the closest source** ("I don't have a confident answer — the closest source is
+X") — deliberately different from the structural refusal's "nothing here."
+
+**Why spread, and not the three tempting alternatives.**
+- **Not the fused RRF score.** It's rank-based and magnitude-blind: for the obvious query
+  `"How do I rotate an API key?"` the top RRF is **0.0328** and the runner-up **0.0318** —
+  a dead heat that says nothing about how clear the winner is. RRF is the right *ranking*
+  signal and the wrong *confidence* signal.
+- **Not an absolute cosine floor** (and *not* the M2 gate's 0.15). Absolute cosine doesn't
+  transfer across embedders — M2 measured Gemini packing even out-of-scope hits at ~0.43.
+  A floor tuned on one embedder silently mis-fires on another. Spread is *relative*, so it
+  transfers: a real winner separates from the pack regardless of the absolute band.
+- **Not BM25 folded into confidence.** BM25 is unbounded and corpus-scale-dependent;
+  including it *destroyed* the separation in testing (it made ambiguous queries look
+  confident on incidental keyword overlap). So the two signals get clean, separate jobs:
+  **BM25 decides *in-scope* (the M2 gate); dense spread decides *confident* (here).**
+
+**The grounding factor.** Spread answers "is there a clear winner"; grounding answers "is the
+drafted answer actually supported by it." For both shipped generators this is **1.0** by
+construction — `ExtractiveGenerator` echoes retrieved text verbatim, and `GeminiGenerator` is
+pinned to the numbered context (an unsupported answer becomes the M3 Layer-2 sentinel, caught
+before we get here). The optional enhancement — an **LLM self-eval** scoring entailment of the
+draft — plugs in *here* as a `<1.0` factor for the gemini path. It stays **off by default** so
+the pipeline needs no API key; turning "grounded?" into a measured number is M5.
+
+**Challenge — the signal's quality is embedder-bound, and I measured it honestly.** Under the
+keyless `hash` embedder the dense arm is *lexical* (≈ BM25, as the M2 write-up shows), so
+spread is muted and the confident/ambiguous bands **overlap** — no threshold cleanly separates
+on this 28-chunk corpus (flagship `rotate` spreads 0.34 while ambiguous `"tell me about
+limits"` spreads ~0.53). The signal only comes alive with a **semantic** embedder, exactly
+where M2 predicted real abstention would live. So the keyless path *computes* confidence and
+*can* abstain, but the clean separation is demonstrated under Gemini:
+
+| Provider (embedder) | Query | Verdict | Confidence | Which layer |
+|---|---|---|---|---|
+| `hash` (keyless) | `How do I rotate an API key?` | answered | **0.340** | — |
+| `hash` (keyless) | `how do I bake sourdough bread` | abstained | 0.000 | 1 · structural (gate empty) |
+| `gemini` | `How do I rotate an API key?` | answered | **0.158** | — |
+| `gemini` | `How do I verify a webhook signature?` | answered | **0.223** | — |
+| `gemini` | `What is the per-call overage rate in USD?` | abstained | 0.000 | 2 · sentinel (on-topic, unanswerable) |
+| `gemini` | `How do I get started?` | **abstained** | **0.095** | **3 · confidence (this milestone)** |
+| `gemini` | `how do I bake sourdough bread` | **abstained** | **0.032** | **3 · confidence** |
+
+Under Gemini the spread separates cleanly across the wider probe set: **every clear query
+lands in 0.14–0.28, every ambiguous or out-of-scope one at ≤ 0.095** — so the
+`confidence_abstain_threshold = 0.12` cut splits them. Two results are worth calling out:
+
+- **The new capability.** `"How do I get started?"` clears the gate and the generator *does*
+  produce an answer (extractive can't refuse) — yet M4 withholds it, because the retrieval is
+  an ambiguous scatter with no clear winner (spread 0.095), and points at the closest source
+  instead. That's the third abstention doing something the M3 layers can't.
+- **Spread is the out-of-scope defense a semantic embedder needs.** `"bake sourdough bread"`
+  abstains *structurally* under `hash` (the gate returns empty) — but under Gemini the 0.15
+  gate floor doesn't transfer, so the query **leaks past the gate** with hits at cosine ~0.44.
+  Nothing separates from that flat field (spread 0.032), so the confidence layer catches the
+  out-of-scope query the gate no longer can. M2's gate and M4's confidence cover each other's
+  blind spots.
+
+**Trade-off / what breaks.** The `0.12` threshold is *one* defensible cut taken from the
+measured CLEAR/ambiguous boundary — precise calibration against the labeled set (abstention
+precision/recall) is **M5**, not guesswork here. A **lone** gated hit scores spread 0 (there's
+no field to stand out from) and is abstained conservatively — a genuinely unique match can be
+refused, a deliberate trade to never claim false confidence from a single incidental hit. And
+the honest limit above stands: under a purely lexical embedder the signal is too weak to
+trust — confidence-calibrated abstention wants a semantic embedder underneath it.
+
 ### Knowledge decay: modeling staleness without ground truth — _tbd (M6)_
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_
 

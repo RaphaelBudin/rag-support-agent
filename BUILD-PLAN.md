@@ -40,16 +40,24 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
   and that the 0.15 cosine floor doesn't transfer to Gemini's compressed score band (→ M5 calibration).
 - *Demo:* `retrieval.search --query "401 Unauthorized error" --show-arms`.
 
-## M3 — Generation + citations
-- Answer synthesis grounded strictly in retrieved context, with inline **citations**.
-- Refuse to answer from parametric memory (grounding-only).
+## M3 — Generation + citations ✅
+- ✅ Answer synthesis grounded strictly in retrieved context, with inline **citations**.
+- ✅ Refuse to answer from parametric memory (grounding-only, two layers: structural gate + sentinel).
+- ✅ Pluggable generator (`extractive` keyless / `gemini`); citations carry the true marker index.
 - *Demo:* question → cited answer.
 
-## M4 — Confidence + abstention (the trust layer)
-- Compute a confidence signal (retrieval score spread + grounding check + optional self-eval).
-- Below threshold → **abstain**: "I don't have a confident answer — here's the closest source / who to ask."
-- **Write-up:** how the confidence signal is computed and calibrated.
-- *Demo:* an out-of-scope question that correctly gets "I don't know".
+## M4 — Confidence + abstention (the trust layer) ✅
+- ✅ Confidence signal `= retrieval_spread × grounding_factor` in `[0,1]`. Backbone = **dense-cosine
+  score spread** (top hit vs. the field) — relative, so it transfers across embedders; *not* the
+  RRF score (magnitude-blind) and *not* the M2 gate's absolute cosine floor (doesn't transfer).
+- ✅ Grounding factor = 1.0 for both shipped generators (extractive verbatim / gemini prompt-pinned);
+  optional LLM self-eval is a pluggable `<1.0` factor for the gemini path, off by default (keyless).
+- ✅ **Third abstention** (distinct from M3's two): retrieved + answered but ambiguous (spread below
+  `confidence_abstain_threshold`) → abstain, pointing at the **closest source**.
+- ✅ **Write-up:** how the confidence signal is computed + measured (keyless-coarse vs. Gemini-separated).
+- ✅ *Demo:* a query that clears the gate and the generator answers, but M4 abstains on low spread
+  (`"How do I get started?"`); confirmed under Gemini where the signal separates cleanly.
+- Threshold *calibration* against the labeled set (abstention precision/recall) is **M5**.
 
 ## M5 — Evaluation harness (the differentiator)
 - Labeled Q/A set in `evaluation/datasets/` (gold question → gold source → gold answer).
