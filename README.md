@@ -176,16 +176,37 @@ abstention (score spread + grounding) is a separate, later threshold.
 python -m rag_support_agent.retrieval.search --query "401 Unauthorized error" --show-arms
 ```
 
-**Honest limitation of the keyless demo.** The default `hash` embedder is *lexical*
-(feature-hashing of tokens), not semantic — so keyless, the dense arm and BM25 largely
-**agree**, and fusion barely reorders them. Hybrid's bigger payoff, recovering pure
-*paraphrases* that share no keywords with the query, needs a real embedder. The harness
-supports it; reproduce with your own key:
+**The semantic half — measured with real embeddings (Gemini).** The default `hash`
+embedder is *lexical* (feature-hashing of tokens), so keyless the dense arm and BM25
+largely **agree** and fusion barely reorders them. Swap in a semantic embedder and
+hybrid's bigger payoff appears — recovering pure *paraphrases* that share no keywords
+with the query. Query `"how do I make a leaked credential stop working immediately"`
+(no words in common with the section *Revoking a key*), with
+`EMBEDDING_PROVIDER=gemini` (`gemini-embedding-001`, 1536-d):
+
+- **Dense ranks `api-keys.md > Revoking a key` #1 (cosine 0.601); BM25 doesn't return it
+  at all.** Pure keyword search misses the canonical answer, the vector finds it, hybrid
+  keeps it (fused #3). This is the case the lexical `hash` embedder *cannot* show.
+
 ```
-EMBEDDING_PROVIDER=openai python -m rag_support_agent.ingestion.run --source data/sample_docs
-EMBEDDING_PROVIDER=openai python -m rag_support_agent.retrieval.search \
+EMBEDDING_PROVIDER=gemini python -m rag_support_agent.ingestion.run --source data/sample_docs
+EMBEDDING_PROVIDER=gemini python -m rag_support_agent.retrieval.search \
   --query "how do I make a leaked credential stop working immediately" --show-arms
 ```
+
+**A gotcha I measured: the cosine floor does not transfer across embedders.** The 0.15
+gate floor makes the gate abstain on `"how do I bake sourdough bread"` under `hash` (best
+cosine 0.064). Under Gemini the *same* out-of-scope query scores cosine **~0.44 on
+unrelated sections** — Gemini packs everything into a high, compressed band — so a 0.15
+floor lets it straight through. Absolute cosine thresholds are provider-specific and need
+calibration (that's M5). It's also *why* real abstention (M4) keys off score **spread**
+(the gap between the top hit and the rest), which is robust across embedders, rather than
+an absolute floor: for the out-of-scope query every hit sits at ~0.43 with no clear
+winner, whereas a real hit tops out at 0.60–0.70 with separation.
+
+> **Gemini normalization note.** `gemini-embedding-001` only pre-normalizes its full
+> 3072-d output; at the 1536-d we request (to match the pgvector column) vectors return
+> with L2-norm ~0.7, so `GeminiEmbedder` L2-normalizes them before storage.
 
 **Also fixed here, found via this measurement.** The dense arm first embedded only the
 chunk *body*, so a chunk whose error code lives in its *heading* (`... > E_RATE_LIMIT

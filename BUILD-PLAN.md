@@ -32,10 +32,12 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
   out-of-scope → empty (feeds M4 abstention).
 - ✅ Demo CLI `retrieval.search --query ... --show-arms` (hybrid + per-arm breakdown).
 - ✅ Unit tests for fusion / tokenizer / gate (DB-free): `tests/test_fusion.py`.
-- ✅ **Write-up:** "Why hybrid retrieval over pure vector" — two reproducible keyless
-  measurements (BM25 recovers a source vector's gate dropped; gate abstains on out-of-scope).
-- ⏳ Semantic/paraphrase half of the write-up needs a real embedder (no OpenAI key in this
-  env). Reproduce recipe is in the README; drop in numbers when a key is available.
+- ✅ **Write-up:** "Why hybrid retrieval over pure vector" — reproducible keyless
+  measurements (BM25 recovers a source vector's gate dropped; gate abstains on out-of-scope)
+  + the semantic half measured with real embeddings.
+- ✅ Semantic/paraphrase half: `GeminiEmbedder` (`gemini-embedding-001`, 1536-d, L2-normalized).
+  Measured — dense finds `Revoking a key` #1 from a keyword-free paraphrase that BM25 misses;
+  and that the 0.15 cosine floor doesn't transfer to Gemini's compressed score band (→ M5 calibration).
 - *Demo:* `retrieval.search --query "401 Unauthorized error" --show-arms`.
 
 ## M3 — Generation + citations

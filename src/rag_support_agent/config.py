@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://rag:rag@localhost:5432/rag"
 
     # Embeddings. Provider "hash" is a deterministic, keyless dev/test embedder so the
-    # repo runs end-to-end with no API key; "openai" is the real one.
-    embedding_provider: str = "hash"  # "hash" | "openai"
+    # repo runs end-to-end with no API key; "openai" and "gemini" are the real ones.
+    embedding_provider: str = "hash"  # "hash" | "openai" | "gemini"
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536  # must match the provider's output and the DB column
 
@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
+    gemini_api_key: str | None = None
 
     # Behavior.
     retrieval_top_k: int = 5
