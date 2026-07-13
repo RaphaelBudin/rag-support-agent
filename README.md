@@ -95,14 +95,45 @@ _(Filled in as the build progresses — see [BUILD-PLAN.md](BUILD-PLAN.md).)_
 
 ## Design decisions (the interesting part)
 
-Short write-ups of the non-obvious calls — this is where the engineering lives:
+Short write-ups of the non-obvious calls — this is where the engineering lives.
 
-- **Why hybrid retrieval over pure vector** — _tbd_
-- **Chunking strategy & why** — _tbd_
-- **Confidence signal: how it's computed and calibrated** — _tbd_
-- **Knowledge decay: modeling staleness without ground truth** — _tbd_
-- **Self-hosted pgvector vs a managed vector DB (cost/control trade-off)** — _tbd_
+### Chunking: heading-aware, section-scoped
+
+**Decision.** Split each document on Markdown headings first — one chunk per section,
+tagged with its full heading path (`API keys > Rotating a key`) — and only *window* a
+section into overlapping pieces if it exceeds a size target (1200 chars, 150 overlap).
+
+**Why not fixed-size windows** (the default everyone reaches for). Support docs are
+already structured by humans into topic-sized sections, and a heading is the strongest
+available signal of what a passage is *about*. Fixed-size chunking cuts across that
+structure — it welds the tail of "Rotating a key" onto the head of "Revoking a key," so
+one chunk half-answers two questions and cites neither cleanly. Heading-first keeps every
+chunk inside a single topic and hands it a precise citation (the heading path), which the
+generation step later reuses verbatim.
+
+**Challenge.** Some sections are longer than you want in one chunk, and naive splitting
+there drops the sentence that straddles the cut. So the windowing fallback packs whole
+*paragraphs* (never mid-paragraph) up to the target and carries a word-aligned overlap
+tail into the next window — a fact split across the boundary survives in both pieces.
+
+**What I measured.** On the sample corpus, heading-aware chunking produced a clean **1
+chunk per section: 28 chunks across 28 distinct (doc, section) pairs**, max 318 chars,
+mean 175. Every section fit under the target, so the windowing path never fired on this
+corpus (it's exercised by a unit test with a synthetic long section). That 1:1 mapping is
+the payoff — every retrieved unit maps to exactly one documentation heading, so citations
+are unambiguous and no vector is diluted by two topics.
+
+**Trade-off / what breaks.** Very short sections (the 62-char minimum here) embed into
+thin vectors — fine for keyword/BM25, weaker for dense semantic match. If sections were
+routinely tiny I'd merge adjacent small siblings under the same parent heading up to a
+floor size. This corpus doesn't need it; a larger one might.
+
+### Why hybrid retrieval over pure vector — _tbd (M2)_
+### Confidence signal: how it's computed and calibrated — _tbd (M4)_
+### Knowledge decay: modeling staleness without ground truth — _tbd (M6)_
+### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPLv3 — see [LICENSE](LICENSE). Copyleft on purpose: this is a public reference
+implementation, and I want derivatives to stay open.

@@ -20,7 +20,7 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
 - ✅ Pluggable embedders: `hash` (keyless dev/test) + `openai`; idempotent upsert into pgvector.
 - ✅ Runs end-to-end keyless: `python -m rag_support_agent.ingestion.run --source data/sample_docs --dry-run`
   → 5 docs → 28 chunks → embedded.
-- ⏳ **Write-up (README design-decisions):** chunking strategy & why — TODO.
+- ✅ **Write-up (README design-decisions):** chunking strategy & why.
 - *Demo:* `docker compose up -d` then ingest (no `--dry-run`) → rows in Postgres.
 
 ## M2 — Retrieval (the core)
