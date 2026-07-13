@@ -15,6 +15,7 @@ The hard part of RAG in production isn't retrieval — it's everything around it
 | Capability | What it does | Why it matters |
 |---|---|---|
 | **Evaluation harness** | Precision/recall on retrieval + answer faithfulness against a labeled Q/A set | You can't improve what you don't measure. Turns "seems good" into a number. |
+| **Grounded generation + citations** | Answers only from retrieved context, with inline `[n]` citations; refuses parametric memory | An answer you can't trace to a source is an answer you can't trust — or debug. |
 | **Confidence + abstention** | Scores answer confidence; says *"I don't know / here's who to ask"* below a threshold | A support bot that hallucinates once loses user trust permanently. |
 | **Knowledge freshness / decay** | Tracks source age; flags knowledge units likely to be stale | Docs rot. Yesterday's correct answer is today's wrong answer. |
 | **Blind-spot detection** | Logs low-confidence / unanswered queries into a knowledge-gap report | Tells you exactly what to write next. Closes the loop. |
@@ -48,7 +49,7 @@ The hard part of RAG in production isn't retrieval — it's everything around it
 
 ## Stack
 
-Python · FastAPI · PostgreSQL + **pgvector** · OpenAI / Claude (pluggable LLM + embedding providers) · BM25 (hybrid) · Docker Compose · a thin chat UI.
+Python · FastAPI · PostgreSQL + **pgvector** · Gemini + a keyless *extractive* fallback (pluggable LLM + embedding providers) · BM25 (hybrid) · Docker Compose · a thin chat UI.
 
 ---
 
@@ -67,7 +68,12 @@ python -m rag_support_agent.ingestion.run --source data/sample_docs
 # 4. Query it — hybrid retrieval with per-arm scores (M2)
 python -m rag_support_agent.retrieval.search --query "401 Unauthorized error" --show-arms
 
-# 6. Run the API + UI  (M3/M8 — not built yet)
+# 5. Ask it — grounded answer with inline citations (M3)
+python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"
+# real synthesis instead of verbatim excerpts (needs GEMINI_API_KEY in .env):
+LLM_PROVIDER=gemini python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"
+
+# 6. Run the API + UI  (M8 — not built yet)
 python -m rag_support_agent.api.server
 # open http://localhost:8000
 
@@ -75,9 +81,11 @@ python -m rag_support_agent.api.server
 python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl
 ```
 
-> **Runs keyless out of the box.** The default embedder (`EMBEDDING_PROVIDER=hash`) is a
-> deterministic, no-API-key stand-in so you can try the whole flow in minutes; set it to
-> `openai` for real embeddings. Ingestion alone needs no database — try
+> **Runs keyless out of the box.** Both the default embedder (`EMBEDDING_PROVIDER=hash`) and
+> the default generator (`LLM_PROVIDER=extractive`) are no-API-key stand-ins, so you can try
+> the whole flow — ingest → retrieve → grounded, cited answer → abstention — in minutes; set
+> `EMBEDDING_PROVIDER=gemini` / `LLM_PROVIDER=gemini` for real embeddings and synthesis.
+> Ingestion alone needs no database — try
 > `python -m rag_support_agent.ingestion.run --source data/sample_docs --dry-run`.
 
 ## Evaluation
@@ -214,6 +222,84 @@ chunk *body*, so a chunk whose error code lives in its *heading* (`... > E_RATE_
 embeds the heading path together with the body (the stored/cited text stays the pure
 body); the same chunk moves to rank **3**. Lesson: embed your headings — they're the
 strongest topic label a chunk has.
+### Grounding & citations: how the agent is stopped from answering off-context
+
+**Decision.** Answer *only* from retrieved context, attach inline `[n]` citations, and
+**abstain** rather than guess. Grounding is enforced in **two independent layers**, and the
+generator is pluggable — a keyless `extractive` default and a real `gemini` synthesizer —
+behind one interface (mirroring the embedder).
+
+**Why two layers, not one prompt.** A support bot that hallucinates *once* loses user trust
+permanently, so the design goal isn't "good answers" — it's "never a confident answer from
+parametric memory." A single "use only the context" line in a prompt is a request, not a
+guarantee. So:
+
+- **Layer 1 — structural (provider-independent, un-foolable).** If the M2 relevance gate
+  returns nothing, the query is out of scope, so the generator is *never called* — the agent
+  abstains. This is the gate from the previous section closing the loop into a refusal; it
+  holds identically under `extractive` and `gemini` because no model runs.
+- **Layer 2 — synthesis.** `ExtractiveGenerator` (the keyless default) grounds *by
+  construction*: it echoes the top retrieved passages verbatim, each `[n]`-tagged, so it
+  physically cannot invent — the strongest grounding guarantee there is, and it's why the
+  repo runs end-to-end for a stranger with no key. `GeminiGenerator` grounds *by prompt*:
+  temperature 0, "use only the numbered context, cite every claim," and a refusal sentinel
+  (`INSUFFICIENT_CONTEXT`) it emits when the context doesn't answer.
+
+**Why the sentinel, when Layer 1 already abstains on empty retrieval.** The gate is coarse —
+a single keyword hit passes it. A passage can clear the gate and still not answer the
+question. The sentinel is the model *refusing parametric memory while on topic* — that's M3
+grounding, and it's deliberately distinct from M4's calibrated, confidence-threshold
+abstention (score spread + a real grounding check).
+
+**Challenge — citations have to be stable handles, not a re-count.** Passages are numbered
+`[1..n]`; the model cites what it uses. On `"How do I rotate an API key?"` Gemini cited `[1]`
+and `[4]`, *skipping* `[2]` and `[3]`. My first cut re-enumerated the citation list to
+`[1],[2]` — so the prose said `[4]` while the list said `[2]`, and a reader couldn't reconcile
+them. The fix: a `Citation` carries its **true marker index**, so the number in the prose and
+the number in the list always agree. Both generators share one numbering (`format_context`)
+and one extractor (`parse_citations`), so a `[n]` means the same passage no matter who wrote
+it — and a hallucinated out-of-range marker (`[9]` when `n=5`) is dropped, never turned into a
+dangling citation.
+
+**A deliberate knob: thinking is off.** `gemini-2.5-flash` ships with a thinking budget;
+grounded extraction over supplied passages isn't a reasoning-heavy task, so I set
+`thinking_budget=0`. That buys determinism and roughly halves latency/tokens (an on-topic
+sentinel refusal costs **6 output tokens**). If the task were multi-hop reasoning *across*
+passages, I'd turn it back on.
+
+**What I measured** (real Gemini, `EMBEDDING_PROVIDER=hash` retrieval so it's reproducible):
+
+| Query | Verdict | Citations | Tokens (in/out) | Latency |
+|---|---|---|---|---|
+| `How do I rotate an API key?` | answered | `[1]` (Rotating a key) + `[4]` (Best practices) | 455 / 101 | ~1.0 s |
+| `What does E_RATE_LIMIT mean and how do I fix it?` | answered | `[1] [2]` `errors.md` **+ `[3]` `billing.md`** | 416 / 137 | ~1.1 s |
+| `What is the per-call overage rate in USD?` | **abstained** (sentinel) | — | 472 / **6** | ~0.6 s |
+| `how do I bake sourdough bread` | **abstained** (structural) | — | *no LLM call* | — |
+
+- **Multi-source grounding.** The `E_RATE_LIMIT` answer fuses `errors.md` (`[1] [2]`) with
+  `billing.md`'s spend-cap note (`[3]`) — a genuinely cross-document citation, each claim
+  tagged to its source.
+- **Refusing to invent a number.** `"per-call overage rate in USD?"` passes the gate on the
+  keyword *overage rate* (`billing.md`), but that doc says the number "is shown on the pricing
+  page" — it isn't in the context. Gemini emits `INSUFFICIENT_CONTEXT` instead of guessing a
+  figure. Grounding, visibly working on an on-topic query.
+- **No hallucinated "closest" source.** `"bake sourdough"` clears neither arm, so the gate
+  returns empty and no model runs — the same result under `extractive` and `gemini`.
+
+```
+python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"   # keyless
+LLM_PROVIDER=gemini python -m rag_support_agent.generation.ask \
+  --query "What is the per-call overage rate in USD?"                              # real, abstains
+```
+
+**Trade-off / what breaks when it fails.** `extractive` is grounded but not fluent — it
+echoes, it can't rephrase or stitch passages together. `gemini`'s grounding is *prompt-*
+enforced, not proven: it can still paraphrase-drift or cite loosely. This layer kills the
+*easy* hallucinations (no source; on-topic-but-unanswerable); it does **not** certify
+faithfulness — that becomes a measured number in M5, and confidence-calibrated abstention is
+M4. `Answer.confidence` here is a deliberate placeholder (the top RRF score) that **no
+decision reads yet**; M3 abstention keys only off retrieval and grounding.
+
 ### Confidence signal: how it's computed and calibrated — _tbd (M4)_
 ### Knowledge decay: modeling staleness without ground truth — _tbd (M6)_
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_

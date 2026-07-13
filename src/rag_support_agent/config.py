@@ -22,9 +22,12 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536  # must match the provider's output and the DB column
 
-    # Generation (used from M3 on).
-    llm_provider: str = "openai"  # "openai" | "anthropic"
-    generation_model: str = "gpt-4o-mini"
+    # Generation (M3). Provider "extractive" is a keyless default that builds the answer
+    # from retrieved passages verbatim (grounding by construction, no API key) so the repo
+    # runs end-to-end for a stranger; "gemini" is the real synthesizer.
+    llm_provider: str = "extractive"  # "extractive" (keyless) | "gemini"
+    generation_model: str = "gemini-2.5-flash"  # used by the gemini provider only
+    generation_temperature: float = 0.0  # 0 => deterministic, grounding-friendly synthesis
 
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None

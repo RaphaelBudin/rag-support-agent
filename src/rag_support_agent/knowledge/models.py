@@ -55,9 +55,10 @@ class AnswerVerdict(str, Enum):
 
 @dataclass
 class Citation:
-    knowledge_unit_id: str
-    source_uri: str
-    score: float
+    index: int              # the inline [n] marker in the answer text — a stable handle
+    knowledge_unit_id: str  # into the retrieved set, NOT a re-enumeration, so prose and
+    source_uri: str         # the citation list always agree (the model may cite [1] and [4]
+    score: float            # while skipping [2]/[3]).
 
 
 @dataclass

@@ -3,7 +3,7 @@
 Exposes /ask and serves the minimal chat UI. Responses carry the trust signals
 (confidence badge, citations, stale flag) so the UI can show them.
 
-TODO(M3/M8): wire answer_question + serve ui/.
+TODO(M8): wire generation.answer.answer_question into /ask + serve ui/.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ def create_app():
     def health() -> dict:
         return {"status": "ok"}
 
-    # @app.post("/ask")  -> answer_question(query)  (TODO)
+    # @app.post("/ask")  -> generation.answer.answer_question(query)  (TODO M8)
     return app
 
 
