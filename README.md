@@ -109,13 +109,17 @@ you get them yourself. Two columns, because half the story is *which* metrics ne
 | p50 / p95 latency | ~30 / ~50 ms | ~480 / ~1170 ms | end-to-end, machine-dependent — semantic pays a per-query embed round-trip |
 | Cost / 1k queries | $0 | ~$0.39 ² | approximate serving cost |
 
-¹ Faithfulness needs the Gemini *generator* (the judge grades generated answers). It is fully
-built and unit-tested, but the number is pending a run: the free-tier key hit its daily
-generation cap (`generate_content`, 20/day). One command fills it once the key is on a paid
-tier: `EMBEDDING_PROVIDER=gemini LLM_PROVIDER=gemini python -m rag_support_agent.eval.run
---dataset evaluation/datasets/support_qa.jsonl`. Keyless, faithfulness is 100% *by
-construction* — the extractive generator echoes retrieved text verbatim, so there is nothing to
-hallucinate (reported, not judged).
+¹ **Pending paid-tier Gemini access — the measurement is built and unit-tested; only the run is
+gated.** Faithfulness grades *generated* answers, so it needs the Gemini generator plus the
+judge (claim-level entailment against the retrieved context, the judge never seeing the
+question — see the *Evaluation harness* write-up below). A full judged pass is ~33
+`generate_content` calls (≈20 generation + ~13 to judge the answered records); the free tier
+this key resolves to — measured at **5 requests/minute** with a low daily generation cap —
+can't sustain that, so the number is **deferred, not faked**. One command fills the cell once
+the key is on a paid tier: `EMBEDDING_PROVIDER=gemini LLM_PROVIDER=gemini python -m
+rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl`. Keyless,
+faithfulness is 100% *by construction* — the extractive generator echoes retrieved text
+verbatim, so there is nothing to hallucinate (reported, not judged).
 ² Approximate: from M3's measured Gemini token counts (~450 in / ~100 out per query) × Gemini
 2.5 Flash list price ($0.30 / $2.50 per 1M in/out). Real per-request cost accounting is M7.
 
