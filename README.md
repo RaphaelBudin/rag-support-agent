@@ -746,7 +746,57 @@ python -m rag_support_agent.api.server                       # keyless; open htt
 LLM_PROVIDER=gemini python -m rag_support_agent.api.server   # real token streaming (respects the 20/day cap)
 ```
 
-### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_
+### Self-hosted pgvector vs a managed vector DB (cost/control trade-off)
+
+**Decision.** Keep the vectors in a Postgres I run myself — `pgvector/pgvector:pg16` behind a
+one-line `docker compose up -d`, a single `db` service, a `CREATE EXTENSION vector` init script,
+and an HNSW index on the `embedding vector(1536)` column. No dedicated vector database (Pinecone
+/ Weaviate / Qdrant Cloud), and no managed vector service — for now.
+
+**Why.** The dense arm is *already* SQL: `1 - (embedding <=> %s)` ordered by the same `<=>`
+cosine-distance operator the `vector_cosine_ops` index is built on. Because it's Postgres, the
+vectors live in the *same* store as everything relational the repo needs — the `knowledge_units`
+rows BM25 reads for the sparse arm (M2), and the append-only `query_events` log the blind-spot
+report reads (M7). One store means hybrid fusion has no cross-system join and no
+vector-index-vs-source-of-truth consistency gap: the row I rank by cosine *is* the row I cite and
+the row I log, under one transaction and one backup. A dedicated vector DB would split that into
+two systems to keep in sync, two backups, two failure modes — plus a per-vector or per-pod bill —
+to buy nothing this corpus needs. And the decisive reason for a *portfolio*: "runs for a stranger
+with `docker compose up` and $0 of infra" is this repo's Definition of "portfolio-ready"
+(keyless-first, everywhere). A hosted vector DB with a signup and a key would break that on the
+very first step.
+
+**The honest part — this isn't "pgvector vs Pinecone," it's "who runs the Postgres."** I'd keep
+pgvector either way; the real axis is self-hosted vs a managed pgvector (Supabase / Neon / RDS).
+I chose self-hosted for reproducibility and $0, and that choice buys nothing at scale — it
+*costs*. It's a single node: I own backup, upgrade, and ops; there's no replication and no HA; a
+lost `pgdata` volume takes the `query_events` history with it (the `knowledge_units` re-ingest
+from `data/sample_docs` — the real logged traffic doesn't). The HNSW index runs on **default
+build parameters** (`m`, `ef_construction`, and query-time `ef_search` all untouched) — fine
+here, but recall and latency on *millions* of vectors is exactly the tuning-and-sharding a managed
+service exists to do for you. What self-hosting buys is control and $0; what it doesn't buy is
+someone else being paged.
+
+**What I can honestly measure — nothing about scale, and that's the point.** The corpus is **28
+vectors** (5 docs → 28 chunks). At 28 rows HNSW is *theatre*: a sequential scan returns identical
+results and the ANN index earns nothing — it's in the schema to show the production *shape*, not
+because this corpus needs it. The cost of the dense arm here is entirely the **embed round-trip**,
+not the search: the Evaluation table's ~480 ms semantic p50 is the per-query Gemini embed call;
+the pgvector lookup itself is negligible beside it. So any claim this design "scales to millions"
+would be **untested** — I have measured it at 28 vectors and nowhere else, and I'm saying so out
+loud rather than implying the HNSW index proves otherwise.
+
+**Trade-off / what it does _not_ do.** This is the cheap, reproducible end of the trade: total
+control, one store, $0 — but I am the operator, there is no HA, and the HNSW knobs that matter at
+scale are unturned and unmeasured. The saving grace is that the *exit* is nearly free, precisely
+because it's pgvector-in-Postgres: moving to a managed pgvector (Supabase / Neon / RDS) the day HA
+or ops actually matter is a **connection-string change, not a re-architecture** — same
+`vector(1536)` column, same `<=>` queries, same HNSW index, same relational tables alongside. The
+schema I'd migrate *to* is the schema already committed. Swapping to a *dedicated* vector DB, by
+contrast, would be a rewrite, and would surrender the single-store property that lets M2's hybrid
+and M7's log share one transaction and one backup. So the decision isn't "pgvector is best at
+scale" — it's "pgvector is the right *first* store, and the one whose scale-up doesn't throw the
+schema away."
 
 ## License
 
