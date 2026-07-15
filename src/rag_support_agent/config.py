@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     freshness_relative_factor: float = 2.0
     freshness_relative_min_gap_days: float = 90.0
 
+    # Blind-spot gap report (M7). When clustering unanswered queries *semantically* (needs a
+    # real embedder), two queries join if their embedding cosine clears this. Measured on
+    # Gemini query embeddings: a disjoint-vocabulary paraphrase pair scores ~0.69 while
+    # unrelated topics sit ~0.46–0.50, so 0.62 merges paraphrases without over-merging. Like
+    # every absolute cutoff here (M2 cosine floor, M4 spread, M6 half-life) it is
+    # embedder-specific — retune it per embedding model, don't assume it transfers.
+    gap_semantic_threshold: float = 0.62
+
 
 @lru_cache
 def get_settings() -> Settings:

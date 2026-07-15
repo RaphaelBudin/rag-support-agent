@@ -45,8 +45,17 @@ _UNIT_COLS = (
 )
 
 
-def _tokenize(text: str) -> list[str]:
+def tokenize(text: str) -> list[str]:
+    """Lowercase, split on the error-code-preserving pattern, drop stopwords.
+
+    Public because it is the repo's single notion of a *salient term*: the M7 blind-spot
+    gap report clusters unanswered queries on the very same tokens BM25 ranks on, so
+    "the questions retrieval failed on" are grouped by the vocabulary the retriever indexes.
+    """
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS]
+
+
+_tokenize = tokenize  # internal alias; the sparse-arm callers below keep their name.
 
 
 def _row_to_unit(row: tuple) -> KnowledgeUnit:

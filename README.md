@@ -84,6 +84,12 @@ python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.js
 EMBEDDING_PROVIDER=gemini python -m rag_support_agent.ingestion.run --source data/sample_docs
 EMBEDDING_PROVIDER=gemini LLM_PROVIDER=gemini \
   python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl --calibrate
+
+# 8. Blind-spot + observability  (M7) — seed the query log, then the knowledge-gap report
+python -m rag_support_agent.observability.replay --dataset evaluation/datasets/support_qa.jsonl --reset
+python -m rag_support_agent.observability.gap_report          # keyless-lexical themes + cost/latency panel
+# cluster paraphrases by *meaning* rather than shared words (needs GEMINI_API_KEY):
+EMBEDDING_PROVIDER=gemini python -m rag_support_agent.observability.gap_report --mode semantic
 ```
 
 > **Runs keyless out of the box.** Both the default embedder (`EMBEDDING_PROVIDER=hash`) and
@@ -569,6 +575,100 @@ scoped to the sources actually **cited** — a stale passage that didn't back th
 surfaced, because the warning is about *this answer's* footing, not the whole KB (that
 corpus-wide "which docs to rewrite next" view is the M7 gap report). A triage signal that
 tells a human where to look first — not an oracle that knows what rotted.
+
+### Blind-spot detection & observability: closing the loop
+
+**Decision.** Append **every served query** to a `query_events` log, then read it two ways:
+the queries we *couldn't* confidently answer become a **knowledge-gap report** — "the top
+things users ask that we can't answer well," i.e. the docs to write next — and the whole log
+rolls up into a per-request **cost / latency / token** panel. Every prior milestone made the
+bot better at answering; this one makes it tell you *what it can't answer yet*. That's the
+loop closing.
+
+**Two views, one append-only table.** Observability wants *all* traffic (what does a query
+cost, how slow is p95); blind-spot detection wants only the failures — the `abstained` subset,
+which is exactly M3's no-source refusal ∪ the sentinel refusal ∪ M4's low-confidence
+abstention. One table serves both. Note the deliberate contrast with `knowledge_units`
+(idempotent upsert): `query_events` is **append-only**, because a question asked ten times is
+not a duplicate to collapse — that repetition *is* the signal (ten people hit the same gap),
+so `count` carries the volume.
+
+**Per-request cost, cross-provider.** Cost is priced onto `Answer.cost_usd` in the thin
+`answer_question` layer (the pure `build_answer` seam stays cost- and log-free), reusing the
+M5 `eval/cost.py` price table — its scope note reserved this exact wiring for M7. The keyless
+extractive path spends no tokens → **$0**, so the default stays free; a real provider's rows
+carry the true token-priced cost. Logging is **opt-in and fail-soft**: eval and tests call
+`build_answer` directly and never log, and a telemetry write that fails is warned-and-swallowed
+— observability must never fail a user's answer. The logged latency is deliberately
+*end-to-end* (retrieve → answer), wider than `Answer.latency_ms` (M6's generation-only slice).
+
+**The honest hard part — clustering "what we can't answer" without an LLM.** A good gap report
+groups *paraphrases of the same missing topic* into one theme. Grouping by **meaning** needs an
+embedding; keyless, all we have is **shared vocabulary**. So, the recurring keyless-coarse
+vs. gated pattern once more:
+- **Keyless-coarse** (`cluster_lexical`): connected components over the *same* error-code-
+  preserving, stopword-stripped tokenizer BM25 ranks on — "the questions retrieval failed on"
+  grouped by the very vocabulary retrieval indexes. Deterministic, order-independent, no key.
+- **Gated-semantic** (`cluster_semantic`): embed the unanswered queries and merge on cosine.
+  Measurable *now* — Gemini **embeddings** aren't under the `generate_content` daily cap the
+  M5 write-up hit — so this is a real number, not a promise.
+
+**What I measured (1) — the report + panel over the 23-case log** (keyless, reproducible;
+`EMBEDDING_PROVIDER=hash`). Replaying the eval set logs 23 queries, 8 of which abstain:
+
+```
+Knowledge-gap report (lexical; abstained 8 / 23)
+  1. [1x] about limits          e.g. "Tell me about limits."                          nearest: billing.md
+  2. [1x] bake bread            e.g. "How do I bake sourdough bread?"                 nearest: — (nothing cleared the gate)
+  3. [1x] between difference    e.g. "What is the difference between Free and Pro?"   nearest: billing.md
+  …
+Observability (per request):  p50/p95 latency ~30 / ~50 ms   abstain rate 34.8%   mean cost $0   0 tokens
+```
+
+The panel proves the keyless path is genuinely free (**$0, 0 tokens**) at a real **~30 / ~50 ms**
+end-to-end (matching the eval table's keyless column); under a provider those columns fill with
+the token-priced cost. The eight abstentions are eight *distinct* topics, so every theme is
+`1×` — which is the honest state of this set, and the segue to (2): the themes only merge when
+two questions are the *same* gap.
+
+**What I measured (2) — where lexical breaks and semantic saves it.** Take a disjoint-vocabulary
+paraphrase pair and two unrelated abstentions; embed with Gemini (`gemini-embedding-001`, 1536-d):
+
+| cosine | export data | copy-of-data | bread | weather |
+|---|---|---|---|---|
+| **export data** | 1.000 | **0.685** | 0.485 | 0.502 |
+| **copy-of-data** | **0.685** | 1.000 | 0.455 | 0.484 |
+| bread | 0.485 | 0.455 | 1.000 | 0.457 |
+
+*"How do I export my data?"* and *"Can I get a copy of everything I've stored?"* share **zero**
+salient terms — `cluster_lexical` **cannot** join them — yet sit at cosine **0.685**, while every
+unrelated pair sits at **0.455–0.502**. That gap is wide enough for one threshold to merge the
+paraphrase and nothing else; `gap_semantic_threshold = 0.62` does exactly that. Run through the
+real report: lexical keeps them as two `1×` themes; **semantic collapses them to one `2×`
+theme** — the same gap, correctly counted twice:
+
+```
+lexical :  [1x] "How do I export my data?"   +   [1x] "Can I get a copy of everything I've stored?"
+semantic:  [2x] theme "copy data"  e.g. "How do I export my data?"
+```
+
+**Trade-off / what breaks.** The keyless clusterer is **single-linkage on shared words**: it
+misses the disjoint-vocabulary paraphrase above (only the embedding joins it) *and* can chain
+(A–B on one term, B–C on another, so A and C land together) — both are the price of having no
+embedding. The semantic path needs a key, and its `0.62` cutoff is **embedder-specific** — the
+same absolute-threshold caveat as M2's cosine floor, M4's spread, and M6's half-life: retune it
+per embedding model, don't assume it transfers. Theme *labels* are coarse for a lone query (they
+default to its top salient terms, so a contraction can leave a stray `s`); the label sharpens
+into real shared vocabulary only once a cluster has volume, which is where it matters. And a
+**privacy** note: logging *user* queries is PII-sensitive — here every query is synthetic (the
+23-case set), and the schema is where a retention/redaction policy would live in production.
+
+```
+python -m rag_support_agent.observability.replay --dataset evaluation/datasets/support_qa.jsonl --reset
+python -m rag_support_agent.observability.gap_report                              # keyless-lexical + panel
+EMBEDDING_PROVIDER=gemini python -m rag_support_agent.observability.gap_report --mode semantic
+```
+
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_
 
 ## License

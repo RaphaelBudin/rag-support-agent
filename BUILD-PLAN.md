@@ -88,11 +88,28 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
 - ✅ *Demo:* `touch -d '2 years ago' data/sample_docs/api-keys.md` + re-ingest → freshness
   0.977 → 0.060, `api-keys.md` flagged on the answer; the intact corpus flags nothing.
 
-## M7 — Blind-spot detection + observability
-- Persist every low-confidence / no-source query → **knowledge-gap report** ("top 10 things users ask that we can't answer").
-- Per-request cost/latency/token logging.
-- **Write-up:** closing the loop — the bot tells you what docs to write next.
-- *Demo:* the gap report.
+## M7 — Blind-spot detection + observability ✅
+- ✅ Persist **every** served query to an append-only `query_events` log (`observability/
+  blindspot.py`, same `get_conn`/`init` pattern as `knowledge/db.py`); the `abstained` subset
+  (M3 no-source ∪ sentinel ∪ M4 low-confidence) becomes the **knowledge-gap report** — "top
+  things users ask that we can't answer." Append-only *on purpose*: a repeated question is
+  volume, not a duplicate to collapse.
+- ✅ Per-request **cost / latency / tokens**: `Answer.cost_usd` priced cross-provider in the
+  thin `answer_question` layer (reusing M5 `eval/cost.py`; `build_answer` stays pure), $0 keyless;
+  end-to-end latency + token counts on each event. Logging is opt-in + fail-soft (eval/tests
+  bypass it; a telemetry failure never fails an answer).
+- ✅ **Keyless-coarse vs. gated** clustering, the recurring pattern: `cluster_lexical`
+  (connected components over the *same* BM25 tokenizer, keyless) and `cluster_semantic`
+  (embedding cosine, gated — measurable now since Gemini *embeddings* dodge the generate cap).
+- ✅ **Write-up:** "closing the loop" — measured the report + observability panel over the
+  23-case log (8 abstained/23, ~30/~50 ms, $0), and the lexical-vs-semantic divergence (a
+  disjoint-vocab paraphrase at cosine 0.685 vs unrelated ≤0.502; lexical splits it, semantic
+  merges it to one `2×` theme). Honest limits: single-linkage chaining, embedder-specific
+  threshold, PII of logging real queries.
+- ✅ Unit-tested (`tests/test_blindspot.py`, pure/DB-free): cost pricing, tokenizer, lexical +
+  semantic clustering, and that `build_answer` stays cost/log-free.
+- ✅ *Demo:* `observability.replay` seeds the log → `observability.gap_report` prints the
+  themes + cost/latency panel; `--mode semantic` clusters paraphrases by meaning.
 
 ## M8 — Thin chat UI + polish
 - Minimal chat interface (streaming, citations, confidence badge, stale flag).

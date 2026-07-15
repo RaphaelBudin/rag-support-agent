@@ -30,10 +30,12 @@ precision/recall) — and the optional LLM self-eval grounding factor — is M5.
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime
 
 from rag_support_agent.config import Settings, get_settings
+from rag_support_agent.eval.cost import TokenUsage, estimate_cost_usd
 from rag_support_agent.generation.generators import Generator, get_generator, parse_citations
 from rag_support_agent.knowledge.freshness import assess_freshness
 from rag_support_agent.knowledge.models import (
@@ -43,6 +45,8 @@ from rag_support_agent.knowledge.models import (
     RetrievalResult,
 )
 from rag_support_agent.retrieval.hybrid import retrieve
+
+logger = logging.getLogger(__name__)
 
 # Shown when the relevance gate returned nothing — the honest out-of-scope refusal.
 NO_SOURCE_MESSAGE = (
@@ -210,19 +214,89 @@ def build_answer(
     )
 
 
+def _generation_cost(usage: TokenUsage, generator: Generator) -> float:
+    """Per-request serving cost in USD from this query's generation token usage (M7).
+
+    Cross-provider: prices ``usage`` at whichever model actually ran (``generator.model``),
+    reusing ``eval/cost.py``'s table — whose scope note reserves exactly this wiring for M7.
+    The keyless ``ExtractiveGenerator`` spends no tokens → $0, so the default path stays free.
+    """
+    if usage.input_tokens == 0 and usage.output_tokens == 0:
+        return 0.0
+    return estimate_cost_usd(usage, getattr(generator, "model", None))
+
+
+def _record_event(
+    query: str,
+    answer: Answer,
+    results: list[RetrievalResult],
+    usage: TokenUsage,
+    latency_ms: float,
+    settings: Settings,
+) -> None:
+    """Append this served query to the blind-spot / observability log (M7).
+
+    Imported lazily so the pure generation path never pulls in psycopg at import time. The
+    logged ``latency_ms`` is the *end-to-end* request time (retrieve → answer, what the user
+    waits) — deliberately wider than ``Answer.latency_ms``, which M6 scoped to the generation
+    slice alone. ``top_source`` is the closest served passage (``None`` when the gate returned
+    nothing).
+    """
+    from rag_support_agent.observability.blindspot import QueryEvent, record
+
+    record(
+        QueryEvent(
+            query=query,
+            confidence=answer.confidence,
+            abstained=answer.verdict is AnswerVerdict.ABSTAINED,
+            top_source=results[0].unit.source_uri if results else None,
+            latency_ms=latency_ms,
+            cost_usd=answer.cost_usd or 0.0,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+        ),
+        settings=settings,
+    )
+
+
 def answer_question(
     query: str,
     top_k: int | None = None,
     generator: Generator | None = None,
     settings: Settings | None = None,
+    record_event: bool = False,
 ) -> Answer:
     """End-to-end: retrieve (hybrid + gate) -> ground -> cite -> answer or abstain.
 
     The only DB-touching step is ``retrieve``; everything after it is the pure
-    ``build_answer`` — which now also attaches the M6 freshness flag. ``cost_usd`` is left
-    unset here; per-request cost accounting is M7.
+    ``build_answer`` — which also attaches the M6 freshness flag. On top of that pure core M7
+    adds two thin layers: it prices this query's generation tokens onto ``Answer.cost_usd``
+    (cross-provider; $0 keyless), and — only when ``record_event`` is set — appends a
+    ``QueryEvent`` to the blind-spot log. Logging is opt-in (eval/tests call ``build_answer``
+    directly and never touch it) and best-effort: a telemetry failure is logged and
+    swallowed, never failing the answer.
     """
     s = settings or get_settings()
+    started = time.perf_counter()
     results = retrieve(query, top_k=top_k, settings=s)
     gen = generator or get_generator(s)
-    return build_answer(query, results, gen, settings=s)
+    # Reset per-call token counters so cost reflects *this* query even on a reused generator
+    # (a Layer-1 abstain never calls generate(), so stale counts would otherwise leak in).
+    for attr in ("last_input_tokens", "last_output_tokens"):
+        if hasattr(gen, attr):
+            setattr(gen, attr, 0)
+
+    answer = build_answer(query, results, gen, settings=s)
+    usage = TokenUsage(
+        input_tokens=getattr(gen, "last_input_tokens", 0),
+        output_tokens=getattr(gen, "last_output_tokens", 0),
+    )
+    answer.cost_usd = _generation_cost(usage, gen)
+    latency_ms = (time.perf_counter() - started) * 1000.0  # end-to-end, for the log
+
+    if record_event:
+        try:
+            _record_event(query, answer, results, usage, latency_ms, s)
+        except Exception as exc:  # telemetry must never fail a user's answer
+            logger.warning("query-event logging failed: %s", exc)
+    return answer

@@ -23,16 +23,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Grounded answer generation demo.")
     parser.add_argument("--query", required=True, help="The question to answer.")
     parser.add_argument("--top-k", type=int, default=None, help="Passages to retrieve.")
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Don't append this query to the blind-spot / observability log (M7).",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
-    answer = answer_question(args.query, top_k=args.top_k, settings=settings)
+    answer = answer_question(
+        args.query, top_k=args.top_k, settings=settings, record_event=not args.no_log
+    )
 
     print(f'\nquery: "{args.query}"')
     print(
         f"provider={settings.llm_provider}  verdict={answer.verdict.value}  "
         f"confidence={answer.confidence:.3f}"
         + (f"  latency={answer.latency_ms:.0f}ms" if answer.latency_ms is not None else "")
+        + (f"  cost=${answer.cost_usd:.6f}" if answer.cost_usd is not None else "")
     )
     print("\n" + answer.text + "\n")
 
