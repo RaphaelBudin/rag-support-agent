@@ -103,23 +103,32 @@ you get them yourself. Two columns, because half the story is *which* metrics ne
 | Metric | Keyless (`hash`) | Semantic (Gemini embed) | What it means |
 |---|---|---|---|
 | Retrieval Recall@5 | 94.1% (16/17) | **100% (17/17)** | gold source is in the top-5 retrieved |
-| Answer faithfulness | 100% *by construction* | _pending_ ¹ | % of answers with zero unsupported claims (LLM-judged) |
+| Answer faithfulness | 100% *by construction* | **100% (11/11)** ¹ | % of answers with zero unsupported claims (LLM-judged) |
 | Abstention precision | 62.5% | **70.0% (7/10)** | when it abstains, it should be right to |
 | Abstention recall | 62.5% | **87.5% (7/8)** | of the questions that should abstain, how many did |
 | p50 / p95 latency | ~30 / ~50 ms | ~480 / ~1170 ms | end-to-end, machine-dependent — semantic pays a per-query embed round-trip |
 | Cost / 1k queries | $0 | ~$0.39 ² | approximate serving cost |
 
-¹ **Pending paid-tier Gemini access — the measurement is built and unit-tested; only the run is
-gated.** Faithfulness grades *generated* answers, so it needs the Gemini generator plus the
-judge (claim-level entailment against the retrieved context, the judge never seeing the
+¹ **Measured via a cross-provider run, because Gemini's free tier structurally can't complete
+the native one.** Faithfulness grades *generated* answers, so it needs a real generator plus
+the judge (claim-level entailment against the retrieved context, the judge never seeing the
 question — see the *Evaluation harness* write-up below). A full judged pass is ~33
-`generate_content` calls (≈20 generation + ~13 to judge the answered records); the free tier
-this key resolves to — measured at **5 requests/minute** with a low daily generation cap —
-can't sustain that, so the number is **deferred, not faked**. One command fills the cell once
-the key is on a paid tier: `EMBEDDING_PROVIDER=gemini LLM_PROVIDER=gemini python -m
-rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl`. Keyless,
-faithfulness is 100% *by construction* — the extractive generator echoes retrieved text
-verbatim, so there is nothing to hallucinate (reported, not judged).
+`generate_content` calls (≈20 generation + ~13 to judge the answered records), and Gemini's free
+tier caps `generate_content` at **20 requests/day** (`GenerateRequestsPerDayPerProjectPerModel-
+FreeTier`, confirmed by the 429 quota metric) — so the Gemini-native run can't finish *regardless
+of pacing or the daily reset*: 33 > 20. (The per-minute rate is **not** the blocker — the key
+sustains bursts far above an earlier note's "5/min"; the binding limit is the daily cap.) So the
+cell is filled by swapping the capped provider out: an **OpenAI generator + OpenAI judge** run
+(`gpt-4o-mini`, temperature 0) over the *same* retrieval. It is same-family (OpenAI judging
+OpenAI), so the judge's correlated-error caveat still applies — but both providers are now wired,
+so the genuinely cross-family pairing (Gemini generate + OpenAI judge) is one flag away once a
+paid Gemini key lifts the cap (see the *Evaluation harness* write-up). Because faithfulness is
+generator-specific, this cell reports the OpenAI generator's grounding (the column's other cells
+are Gemini-generated). Reproduce: `EMBEDDING_PROVIDER=gemini LLM_PROVIDER=openai
+OPENAI_API_KEY=... python -m rag_support_agent.eval.run --dataset
+evaluation/datasets/support_qa.jsonl`; a paid-tier Gemini key runs the fully native pass with
+`LLM_PROVIDER=gemini`. Keyless, faithfulness is 100% *by construction* — the extractive generator
+echoes retrieved text verbatim, so there is nothing to hallucinate (reported, not judged).
 ² Approximate: from M3's measured Gemini token counts (~450 in / ~100 out per query) × Gemini
 2.5 Flash list price ($0.30 / $2.50 per 1M in/out). Real per-request cost accounting is M7.
 
@@ -428,10 +437,11 @@ only*. Three deliberate choices make the number mean something:
   optional LLM self-eval scoring entailment of the draft. This *is* that primitive, run as an
   eval-time measurement; the identical call can later become the online `<1.0` grounding factor.
 
-Faithfulness is therefore **Gemini-gated**, and the harness says so: keyless, the extractive
-generator is grounded *by construction* (it echoes retrieved text verbatim, so there is nothing
-to hallucinate) — reported as 100%-by-construction, not judged, because judging a tautology
-just costs tokens. Recall, abstention, and latency all run keyless and reproducible.
+Faithfulness is therefore **LLM-gated** (a real generator — Gemini or OpenAI — plus the judge),
+and the harness says so: keyless, the extractive generator is grounded *by construction* (it
+echoes retrieved text verbatim, so there is nothing to hallucinate) — reported as
+100%-by-construction, not judged, because judging a tautology just costs tokens. Recall,
+abstention, and latency all run keyless and reproducible.
 
 **Challenge — the harness must not silently re-implement the pipeline.** To calibrate the
 threshold I need each answer's *intermediate* signals (which abstention layer fired, the raw
@@ -476,7 +486,12 @@ curve are the deliverable, not the second decimal of a threshold; a production s
 hundreds of labeled tickets. The judge is itself an LLM, and Gemini judging Gemini risks
 *correlated error* (a model rating its own phrasing as grounded); it is mitigated by the judge's
 task being far narrower than generation (entailment over given text, temperature 0, strict
-rubric), and a cross-family judge is the clean next step. Finally the harness is **quota-aware**
+rubric). The measured cell above runs OpenAI generating *and* judging — **same-family**, so that
+caveat still applies (now to OpenAI, not Gemini). The genuinely **cross-family** judge (generate
+with one family, judge with the other — which removes the correlation outright) is now a
+one-flag swap rather than unbuilt: both providers are wired, so it runs the moment a second
+generate-capable key is in play, e.g. a paid Gemini key generating against the OpenAI judge.
+Finally the harness is **quota-aware**
 — it paces and backs off on a per-minute limit but *fails fast* on a spent daily bucket (keying
 off the server's `retryDelay` magnitude, not the quota label), so a run dies in seconds with
 guidance instead of burning minutes to fail.

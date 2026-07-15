@@ -11,11 +11,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Gemini 2.5 Flash standard (paid-tier) list price, per 1M tokens, as published at
-# https://ai.google.dev/gemini-api/docs/pricing (captured 2026-07-13). Output includes
-# thinking tokens — we run thinking_budget=0, so output is pure answer/judge tokens.
-GEMINI_2_5_FLASH_INPUT_USD_PER_1M = 0.30
-GEMINI_2_5_FLASH_OUTPUT_USD_PER_1M = 2.50
+# Published (paid-tier) list prices, USD per 1M tokens, as (input, output). Sources:
+# Gemini 2.5 Flash — https://ai.google.dev/gemini-api/docs/pricing (captured 2026-07-13);
+# gpt-4o-mini    — https://openai.com/api/pricing (captured 2026-07-15). Output excludes
+# thinking tokens for both (we run thinking_budget=0 / a non-reasoning model), so it is pure
+# answer/judge output. Matched by model-name prefix so the cost row is right for whichever
+# provider actually ran, not silently the default's price on another model's tokens.
+_PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gpt-4o-mini": (0.15, 0.60),
+}
+_DEFAULT_MODEL = "gemini-2.5-flash"
 
 
 @dataclass
@@ -32,9 +38,20 @@ class TokenUsage:
         )
 
 
-def estimate_cost_usd(usage: TokenUsage) -> float:
-    """List-price cost of one query's token usage (generation + judge), in USD."""
-    return (
-        usage.input_tokens / 1_000_000 * GEMINI_2_5_FLASH_INPUT_USD_PER_1M
-        + usage.output_tokens / 1_000_000 * GEMINI_2_5_FLASH_OUTPUT_USD_PER_1M
-    )
+def _price_for(model: str | None) -> tuple[float, float]:
+    """(input, output) $/1M for ``model``, matched by prefix; falls back to the default model."""
+    name = model or _DEFAULT_MODEL
+    for prefix, price in _PRICING_USD_PER_1M.items():
+        if name.startswith(prefix):
+            return price
+    return _PRICING_USD_PER_1M[_DEFAULT_MODEL]
+
+
+def estimate_cost_usd(usage: TokenUsage, model: str | None = None) -> float:
+    """List-price cost of one query's token usage (generation or judge), in USD.
+
+    ``model`` selects the price band (default: the Gemini generator's). Pass the model that
+    actually produced ``usage`` so an OpenAI run isn't costed at Gemini's rates.
+    """
+    in_price, out_price = _price_for(model)
+    return usage.input_tokens / 1_000_000 * in_price + usage.output_tokens / 1_000_000 * out_price

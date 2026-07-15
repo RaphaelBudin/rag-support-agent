@@ -30,10 +30,12 @@ an LLM self-eval scoring entailment of the draft by its context. Here it is the 
 Gemini risks *correlated error* — a model may rate its own phrasing as grounded. Mitigations:
 the judge's task (entailment against given text) is far narrower and easier than open
 generation, so it is more reliable than the thing it checks; temperature 0 + a strict rubric
-cut variance. A cross-family judge (a non-Gemini model) would remove the correlation and is
-the natural next step. Gemini-gated by construction: keyless, ``ExtractiveGenerator`` is
-faithful *by construction* (verbatim echo), so there is nothing to measure — the harness
-reports that path as grounded-by-construction rather than paying to judge a tautology.
+cut variance. A cross-family judge (a non-Gemini model) removes the correlation outright, and
+``OpenAIJudge`` provides one — so the cross-family pairing (generate with one family, judge with
+the other) is now a config swap, gated only on having quota on both. LLM-gated by construction:
+keyless, ``ExtractiveGenerator`` is faithful *by construction* (verbatim echo), so there is
+nothing to measure — the harness reports that path as grounded-by-construction rather than
+paying to judge a tautology.
 """
 
 from __future__ import annotations
@@ -135,15 +137,49 @@ class GeminiJudge:
         return FaithfulnessResult(_parse_verdicts(resp.text or "[]"), usage)
 
 
-def get_judge(settings: Settings | None = None) -> Judge | None:
-    """A Gemini judge when the config can support it, else ``None`` (keyless → skip).
+class OpenAIJudge:
+    """LLM-as-judge over OpenAI chat completions, mirroring ``generators.OpenAIGenerator``.
 
-    Faithfulness needs an LLM, so it is Gemini-gated exactly like real synthesis. Returning
-    ``None`` (rather than raising) lets the harness compute every keyless metric and simply
-    report faithfulness as skipped.
+    Same entailment prompt, temperature, and JSON contract as ``GeminiJudge`` — the judge's
+    task is fixed, only the model changes. Pairing an OpenAI judge with a Gemini generator
+    (or vice-versa) is the *cross-family* check the write-up names: a judge from a different
+    family cannot rate its own phrasing as grounded, removing the correlated-error risk.
+    """
+
+    def __init__(self, model: str, api_key: str | None, temperature: float = 0.0) -> None:
+        from openai import OpenAI
+
+        self.model = model
+        self.temperature = temperature
+        self._client = OpenAI(api_key=api_key)
+
+    def judge(self, answer_text: str, context: str) -> FaithfulnessResult:
+        prompt = f"{_JUDGE_INSTRUCTION}\n\nCONTEXT:\n{context}\n\nANSWER:\n{answer_text}"
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        usage = resp.usage
+        token_usage = TokenUsage(
+            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        )
+        return FaithfulnessResult(_parse_verdicts(resp.choices[0].message.content or "[]"), token_usage)
+
+
+def get_judge(settings: Settings | None = None) -> Judge | None:
+    """An LLM judge when the config can support it, else ``None`` (keyless → skip).
+
+    Faithfulness needs an LLM, so it is gated exactly like real synthesis — matched to the
+    active ``llm_provider``. Returning ``None`` (rather than raising) lets the harness compute
+    every keyless metric and simply report faithfulness as skipped.
     """
     s = settings or get_settings()
-    if s.llm_provider != "gemini" or not s.gemini_api_key:
-        return None
-    model = s.generation_model if s.generation_model.startswith("gemini") else "gemini-2.5-flash"
-    return GeminiJudge(model, s.gemini_api_key)
+    if s.llm_provider == "gemini" and s.gemini_api_key:
+        model = s.generation_model if s.generation_model.startswith("gemini") else "gemini-2.5-flash"
+        return GeminiJudge(model, s.gemini_api_key)
+    if s.llm_provider == "openai" and s.openai_api_key:
+        model = s.generation_model if s.generation_model.startswith("gpt") else "gpt-4o-mini"
+        return OpenAIJudge(model, s.openai_api_key)
+    return None

@@ -1,6 +1,6 @@
 """Answer generators behind a tiny interface (mirrors ``retrieval.embeddings``).
 
-Two implementations, selected by ``LLM_PROVIDER``:
+Three implementations, selected by ``LLM_PROVIDER``:
 
   - ExtractiveGenerator: the keyless default. It does not *synthesize* — it returns the
     top retrieved passages verbatim, each tagged with an inline ``[n]`` citation marker.
@@ -8,10 +8,13 @@ Two implementations, selected by ``LLM_PROVIDER``:
     cannot hallucinate), which is exactly why it makes a safe zero-key default: a reviewer
     can run the whole pipeline (retrieve -> ground -> cite -> abstain) with no API key.
 
-  - GeminiGenerator: the real synthesizer. Same grounding contract, enforced by a strict
-    prompt (only the provided context, cite every claim, refuse when the context does not
-    answer) at temperature 0. This is prompt-enforced grounding, not proven grounding —
-    which is why M5 measures answer *faithfulness* as a number.
+  - GeminiGenerator / OpenAIGenerator: the real synthesizers. Same grounding contract,
+    enforced by the *same* strict prompt (only the provided context, cite every claim,
+    refuse when the context does not answer) at temperature 0 — only the model behind it
+    differs. This is prompt-enforced grounding, not proven grounding, which is why M5
+    measures answer *faithfulness* as a number. Two families exist so that measurement can
+    run despite Gemini's free-tier daily cap, and so generation and the M5 judge can be on
+    *different* families (the cross-family check the write-up calls the next step).
 
 Both paths share the *same* passage numbering (``format_context``) and the *same* citation
 extractor (``parse_citations``), so a ``[n]`` marker means the same thing regardless of who
@@ -115,7 +118,7 @@ class ExtractiveGenerator:
         return GenResult(text="\n".join(lines).strip())
 
 
-_GEMINI_INSTRUCTION = (
+_GROUNDING_INSTRUCTION = (
     "You are a support assistant. Answer the user's question using ONLY the numbered "
     "context passages provided below. Do not use any outside or prior knowledge.\n"
     "- Ground every statement in the context and cite it with the passage number in "
@@ -151,7 +154,7 @@ class GeminiGenerator:
         from google.genai import types
 
         prompt = (
-            f"{_GEMINI_INSTRUCTION}\n\nContext:\n{format_context(results)}\n\n"
+            f"{_GROUNDING_INSTRUCTION}\n\nContext:\n{format_context(results)}\n\n"
             f"Question: {query}\n\nAnswer:"
         )
         resp = self._client.models.generate_content(
@@ -171,6 +174,49 @@ class GeminiGenerator:
         return GenResult(text=text)
 
 
+class OpenAIGenerator:
+    """Real synthesis via OpenAI chat completions, under the *same* grounding contract.
+
+    Byte-for-byte the same prompt as ``GeminiGenerator`` (only the context, cite every claim,
+    or emit the sentinel) at temperature 0 — the provider swap must not change the grounding
+    rules, only the model behind them. It exists because Gemini's free tier caps
+    ``generate_content`` at ~20 requests/day, which is fewer than a full judged eval needs; a
+    key on another provider lets that measurement actually run. It also enables the
+    *cross-family* judge pairing the M5 write-up names as the next step (generate with one
+    family, judge with another), removing the self-grading correlation risk.
+    """
+
+    def __init__(self, model: str, api_key: str | None, temperature: float) -> None:
+        from openai import OpenAI
+
+        self.model = model
+        self.temperature = temperature
+        self._client = OpenAI(api_key=api_key)
+        # Same contract as GeminiGenerator: token counts from the most recent call, read by
+        # the eval harness for the cost row. Not the production cost path (that is M7).
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+
+    def generate(self, query: str, results: list[RetrievalResult]) -> GenResult:
+        prompt = (
+            f"{_GROUNDING_INSTRUCTION}\n\nContext:\n{format_context(results)}\n\n"
+            f"Question: {query}\n\nAnswer:"
+        )
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        usage = resp.usage
+        self.last_input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        self.last_output_tokens = getattr(usage, "completion_tokens", 0) or 0
+        text = (resp.choices[0].message.content or "").strip()
+        # Empty output or the refusal sentinel => the model declined to answer from context.
+        if not text or text.startswith(SENTINEL):
+            return GenResult(text=INSUFFICIENT_CONTEXT_MESSAGE, abstained=True)
+        return GenResult(text=text)
+
+
 def get_generator(settings: Settings | None = None) -> Generator:
     s = settings or get_settings()
     if s.llm_provider == "extractive":
@@ -179,6 +225,11 @@ def get_generator(settings: Settings | None = None) -> Generator:
         # Fall back to a Gemini model name if the config still holds a non-Gemini default.
         model = s.generation_model if s.generation_model.startswith("gemini") else "gemini-2.5-flash"
         return GeminiGenerator(model, s.gemini_api_key, s.generation_temperature)
+    if s.llm_provider == "openai":
+        # generation_model defaults to a Gemini name; fall back to a chat model if it isn't one.
+        model = s.generation_model if s.generation_model.startswith("gpt") else "gpt-4o-mini"
+        return OpenAIGenerator(model, s.openai_api_key, s.generation_temperature)
     raise ValueError(
-        f"unsupported llm_provider: {s.llm_provider!r} (supported: 'extractive', 'gemini')"
+        f"unsupported llm_provider: {s.llm_provider!r} "
+        "(supported: 'extractive', 'gemini', 'openai')"
     )

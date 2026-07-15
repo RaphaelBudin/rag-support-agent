@@ -24,9 +24,9 @@ class Settings(BaseSettings):
 
     # Generation (M3). Provider "extractive" is a keyless default that builds the answer
     # from retrieved passages verbatim (grounding by construction, no API key) so the repo
-    # runs end-to-end for a stranger; "gemini" is the real synthesizer.
-    llm_provider: str = "extractive"  # "extractive" (keyless) | "gemini"
-    generation_model: str = "gemini-2.5-flash"  # used by the gemini provider only
+    # runs end-to-end for a stranger; "gemini" and "openai" are the real synthesizers.
+    llm_provider: str = "extractive"  # "extractive" (keyless) | "gemini" | "openai"
+    generation_model: str = "gemini-2.5-flash"  # gemini path; openai path defaults to gpt-4o-mini
     generation_temperature: float = 0.0  # 0 => deterministic, grounding-friendly synthesis
 
     openai_api_key: str | None = None

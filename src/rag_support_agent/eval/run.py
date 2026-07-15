@@ -275,12 +275,13 @@ def judge_faithfulness(
     return aggregate_faithfulness(per_answer), judge_usage
 
 
-def _serving_cost_per_1k(records: list[EvalRecord]) -> float | None:
+def _serving_cost_per_1k(records: list[EvalRecord], model: str | None = None) -> float | None:
     """Approx. serving cost per 1000 queries: mean generation tokens × list price × 1000.
 
     The judge is an offline eval expense, so it is *excluded* here — this row is what it costs
     to answer a user, not to grade the run. ``None`` when no generation tokens were spent
-    (keyless extractive path).
+    (keyless extractive path). ``model`` selects the price band so an OpenAI run is costed at
+    OpenAI's rates, not Gemini's.
     """
     total = TokenUsage()
     for rec in records:
@@ -291,7 +292,7 @@ def _serving_cost_per_1k(records: list[EvalRecord]) -> float | None:
         input_tokens=total.input_tokens // max(len(records), 1),
         output_tokens=total.output_tokens // max(len(records), 1),
     )
-    return estimate_cost_usd(mean) * 1000
+    return estimate_cost_usd(mean, model) * 1000
 
 
 # --------------------------------------------------------------------------- rendering
@@ -309,7 +310,7 @@ def _print_config_banner(settings: Settings, judge: Judge | None) -> None:
         f"  embedder={settings.embedding_provider}  generator={settings.llm_provider}  "
         f"top_k={settings.retrieval_top_k}  threshold={settings.confidence_abstain_threshold}"
     )
-    mode = "KEYLESS (reproducible, confidence muted)" if keyless else "GEMINI-GATED (full suite)"
+    mode = "KEYLESS (reproducible, confidence muted)" if keyless else "LLM-GATED (full suite)"
     print(f"  mode: {mode}")
     print(f"  faithfulness judge: {'on' if judge else 'off (keyless / no key)'}")
     print("=" * 70)
@@ -433,13 +434,13 @@ def run(
             f"answers with 0 unsupported claims ({faith_agg.fully_grounded}/"
             f"{faith_agg.judged_answers}); claim-level {_fmt_pct(faith_agg.claim_support_rate)}"
         )
-        judge_cost = estimate_cost_usd(judge_usage)
+        judge_cost = estimate_cost_usd(judge_usage, getattr(judge, "model", None))
     else:
         faith = "100%*"
         faith_note = "*grounded by construction (extractive echo) — not LLM-judged; set LLM_PROVIDER=gemini"
         judge_cost = 0.0
 
-    cost_per_1k = _serving_cost_per_1k(records)
+    cost_per_1k = _serving_cost_per_1k(records, getattr(generator, "model", None))
     _print_table(records, settings, faith, faith_note, cost_per_1k)
 
     if judge is not None and judge_cost:
