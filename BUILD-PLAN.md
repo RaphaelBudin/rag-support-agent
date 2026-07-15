@@ -76,10 +76,17 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
   the judge never sees the question — faithfulness ≠ correctness) + the calibration curve.
 - *Demo:* `eval.run` prints the table; `--calibrate` prints the precision/recall curve.
 
-## M6 — Knowledge freshness / decay
-- Score staleness from source age + update signals; surface a "possibly stale" flag on answers.
-- **Write-up:** modeling decay without ground truth.
-- *Demo:* age a source → answer gets flagged.
+## M6 — Knowledge freshness / decay ✅
+- ✅ Score decay *risk* from source age (`source_updated_at`) — two signals: absolute
+  half-life (`0.5 ** (age/half_life)`) + relative age-outlier vs the retrieved field
+  (transfers across absolute bands, cf. M4; silent on a uniform / fresh-clone corpus).
+- ✅ Surface a "possibly stale" flag on answers: `knowledge/freshness.py` (pure, keyless,
+  injectable `now`), wired in `build_answer` → `Answer.stale_sources` (scoped to the cited
+  sources), shown in the `ask` CLI. Unit-tested (`tests/test_freshness.py`, 17 cases).
+- ✅ **Write-up:** "modeling decay without ground truth" — mtime is a checkout artifact, age
+  is a risk proxy (not a verdict), and production swaps in a real content-change timestamp.
+- ✅ *Demo:* `touch -d '2 years ago' data/sample_docs/api-keys.md` + re-ingest → freshness
+  0.977 → 0.060, `api-keys.md` flagged on the answer; the intact corpus flags nothing.
 
 ## M7 — Blind-spot detection + observability
 - Persist every low-confidence / no-source query → **knowledge-gap report** ("top 10 things users ask that we can't answer").

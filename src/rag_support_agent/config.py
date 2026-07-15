@@ -54,6 +54,20 @@ class Settings(BaseSettings):
     chunk_target_chars: int = 1200
     chunk_overlap_chars: int = 150
 
+    # Freshness / decay (M6). Age becomes a decay-*risk* score, NOT a staleness measurement
+    # (no ground truth says a doc is wrong now). Two complementary signals, mirroring M4's
+    # "relative transfers, absolute floor doesn't":
+    #  - Absolute: freshness = 0.5 ** (age_days / half_life). A source is flagged "possibly
+    #    stale" when it falls past ``freshness_stale_score`` (default 0.5 = one half-life old).
+    #    ``half_life`` is a policy knob set to the domain's rate of change, not learned.
+    #  - Relative: among the retrieved sources, one whose age is >= factor x the median peer
+    #    age AND at least ``min_gap_days`` older is an age-outlier — transfers across absolute
+    #    bands and stays silent on a uniform corpus (e.g. a fresh clone resets every mtime).
+    freshness_half_life_days: float = 180.0
+    freshness_stale_score: float = 0.5
+    freshness_relative_factor: float = 2.0
+    freshness_relative_min_gap_days: float = 90.0
+
 
 @lru_cache
 def get_settings() -> Settings:

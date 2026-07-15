@@ -31,9 +31,11 @@ precision/recall) — and the optional LLM self-eval grounding factor — is M5.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 from rag_support_agent.config import Settings, get_settings
 from rag_support_agent.generation.generators import Generator, get_generator, parse_citations
+from rag_support_agent.knowledge.freshness import assess_freshness
 from rag_support_agent.knowledge.models import (
     Answer,
     AnswerVerdict,
@@ -130,11 +132,32 @@ def _abstain(
     )
 
 
+def _stale_cited_sources(
+    results: list[RetrievalResult],
+    citations: list[Citation],
+    settings: Settings,
+    now: datetime | None,
+) -> list[str]:
+    """Freshness flag (M6): possibly-stale sources *among the ones backing this answer*.
+
+    Freshness is assessed over the full retrieved set (that field is what the relative
+    age-outlier signal needs), but we surface only the sources the reader actually sees —
+    the cited ones — so the warning matches the answer's footnotes. If the generator cited
+    nothing, we fall back to the served top passage's source.
+    """
+    report = assess_freshness(results, settings=settings, now=now)
+    if not report.stale_sources:
+        return []
+    shown = {c.source_uri for c in citations} or {results[0].unit.source_uri}
+    return [src for src in report.stale_sources if src in shown]
+
+
 def build_answer(
     query: str,
     results: list[RetrievalResult],
     generator: Generator,
     settings: Settings | None = None,
+    now: datetime | None = None,
 ) -> Answer:
     """Turn retrieved results + a generator into a grounded, cited ``Answer``. Pure (no DB).
 
@@ -144,8 +167,10 @@ def build_answer(
     fully-formed answer is withheld if confidence (retrieval spread) is below threshold —
     an ambiguous retrieval with no clear winner. Only past all three do we build the
     citation list from the ``[n]`` markers the generator actually used, so a citation always
-    points at a passage that was really cited.
+    points at a passage that was really cited. Finally we attach the M6 freshness flag over
+    the cited sources (``now`` is injectable so the check is deterministic in tests).
     """
+    s = settings or get_settings()
     if not results:
         return _abstain(NO_SOURCE_MESSAGE)
 
@@ -160,8 +185,7 @@ def build_answer(
     # Layer 3 — confidence (M4): the answer exists but the retrieval was ambiguous. Abstain
     # below threshold, surfacing the actual (low) confidence and the closest source.
     confidence = compute_confidence(query, results)
-    threshold = (settings or get_settings()).confidence_abstain_threshold
-    if confidence < threshold:
+    if confidence < s.confidence_abstain_threshold:
         return _abstain(_low_confidence_message(results), latency_ms, confidence)
 
     # Ascending marker order for the citation list (footnote convention); each Citation
@@ -181,6 +205,7 @@ def build_answer(
         text=gen.text,
         confidence=confidence,
         citations=citations,
+        stale_sources=_stale_cited_sources(results, citations, s, now),
         latency_ms=latency_ms,
     )
 
@@ -194,8 +219,8 @@ def answer_question(
     """End-to-end: retrieve (hybrid + gate) -> ground -> cite -> answer or abstain.
 
     The only DB-touching step is ``retrieve``; everything after it is the pure
-    ``build_answer``. ``cost_usd`` and stale-source flags are left unset here — cost
-    accounting is M7 and freshness is M6.
+    ``build_answer`` — which now also attaches the M6 freshness flag. ``cost_usd`` is left
+    unset here; per-request cost accounting is M7.
     """
     s = settings or get_settings()
     results = retrieve(query, top_k=top_k, settings=s)

@@ -38,6 +38,7 @@ The hard part of RAG in production isn't retrieval — it's everything around it
    │  (thin)      │   │ answer + cite  │   │   + relevance gate        │
    └──────────────┘   │ + confidence   │   └───────────────────────────┘
                       │ + abstention   │
+                      │ + stale flag   │
                       └───────┬────────┘
                               │  low-confidence / no-source
                               ▼
@@ -496,7 +497,78 @@ Finally the harness is **quota-aware**
 off the server's `retryDelay` magnitude, not the quota label), so a run dies in seconds with
 guidance instead of burning minutes to fail.
 
-### Knowledge decay: modeling staleness without ground truth — _tbd (M6)_
+### Knowledge decay: modeling staleness without ground truth
+
+**Decision.** Score every retrieved source's *decay risk* from its last-updated timestamp
+and attach a **"possibly stale"** flag to the sources backing an answer. Two complementary
+signals, flagged if *either* fires:
+- **Absolute** — an exponential half-life over age: `freshness = 0.5 ** (age / half_life)`
+  (half-life 180 d by default). Past one half-life (score < 0.5) the source is flagged.
+- **Relative** — a source whose age is a strong outlier above the *other retrieved sources*
+  (≥ 2× the median peer age, **and** ≥ 90 days older).
+
+Crucially this is a **risk flag, not a correctness verdict** — and why that distinction is
+forced on us is the honest core of the milestone.
+
+**Why there's no ground truth (the honest hard part).** Every prior milestone had a right
+answer to measure against — a gold source (M2/M5), a faithfulness label (M5). Decay has
+none: **nothing in the corpus says "this doc is wrong now."** The only signal is *when the
+source was last updated*, and age is a *proxy for decay risk*, not a measurement of
+staleness. A five-year-old doc for a stable API is correct; a two-day-old doc can already be
+wrong. So M6 cannot output "stale / fresh" — it outputs "re-verify this one first," a triage
+signal for a human, and says so on the tin.
+
+**Why two signals — the M4 lesson, reused.** M4 established that a *relative* signal (spread
+of the top hit over the field) transfers across embedders where an *absolute* floor (a fixed
+cosine) does not. Age has the same trap: an absolute "90 days = stale" threshold is
+domain-specific — a pricing page rots in weeks, a legal doc in years — the freshness analogue
+of M2's non-transferring cosine floor. So the absolute signal is a *tunable half-life* set to
+the domain's rate of change (a policy knob, not learned), **and** a *relative* outlier signal
+that transfers across absolute bands catches "this source lags its peers" regardless of the
+corpus's overall age. Absolute catches "the whole KB is old"; relative catches "this one is
+behind." They cover each other, exactly as M2's gate and M4's spread do.
+
+**Challenge — the timestamp is a checkout artifact.** `source_updated_at` is the file *mtime*
+at ingest. A fresh `git clone` stamps every file with the clone time, so absolute age
+collapses to ~0 for the entire corpus and the absolute signal silently reports "nothing
+stale." I handle it two ways. **(1)** The relative signal degrades correctly: on a uniform
+corpus there is no outlier, so it flags *nothing* rather than firing arbitrarily — the honest
+"I can't distinguish freshness here" state, pinned by a unit test
+(`test_uniform_fresh_clone_flags_nothing`). **(2)** mtime is only the *keyless stand-in*. The
+model takes **any** timestamp; in production you feed a real content-change signal — the git
+last-commit date, a CMS `updated_at`, the resolution date of the source ticket — and because
+ingestion already persists `source_updated_at` as `TIMESTAMPTZ`, swapping the *source* of
+that timestamp is a one-line change in `loader.py`, not a schema change.
+
+**What I measured** (keyless, reproducible — `EMBEDDING_PROVIDER=hash`):
+
+| Source (retrieved for *"How do I rotate an API key?"*) | Age | Freshness | Flag |
+|---|---|---|---|
+| `api-keys.md` — baseline | 6.1 d | **0.977** | — |
+| `api-keys.md` — after `touch -d '2 years ago'` + re-ingest | 730 d | **0.060** | **`absolute+relative`** |
+| `authentication.md`, `errors.md` — untouched | 6.1 d | 0.977 | — |
+
+Age one source back two years and re-ingest: its freshness drops 0.977 → 0.060, it trips
+*both* signals (four half-lives old **and** now the corpus age-outlier), and the answer citing
+it carries the warning. The two untouched sources stay fresh — the flag is scoped to the aged
+doc, not smeared across the answer. On the intact corpus (every doc ~6 days old) **nothing
+flags** — no false alarm.
+
+```
+python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"   # clean
+touch -d '2 years ago' data/sample_docs/api-keys.md
+python -m rag_support_agent.ingestion.run --source data/sample_docs
+python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"   # api-keys.md flagged
+```
+
+**Trade-off / what breaks.** Age is not wrongness, so both error directions exist and are
+unfixable keyless: a stable-but-old doc **false-positives** (flagged though still correct),
+and a doc made wrong yesterday by a silent upstream edit **false-negatives** (young, so
+unflagged). The half-life is a policy knob, not a learned rate. And the flag is deliberately
+scoped to the sources actually **cited** — a stale passage that didn't back the answer isn't
+surfaced, because the warning is about *this answer's* footing, not the whole KB (that
+corpus-wide "which docs to rewrite next" view is the M7 gap report). A triage signal that
+tells a human where to look first — not an oracle that knows what rotted.
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_
 
 ## License

@@ -42,6 +42,11 @@ def main() -> None:
             print("  (none — answer cited no passage)")
         for c in answer.citations:
             print(f"  [{c.index}] {c.source_uri}  (unit {c.knowledge_unit_id}, rrf {c.score:.4f})")
+
+    if answer.stale_sources:
+        print("\n⚠ possibly stale sources (age is a decay-risk proxy, not a verdict — re-verify):")
+        for src in answer.stale_sources:
+            print(f"  - {src}")
     print()
 
 
