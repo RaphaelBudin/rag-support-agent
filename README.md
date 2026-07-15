@@ -724,6 +724,11 @@ the `done`. Cost is **$0** at a few ms end-to-end, and every served query is app
 `query_events` log — so the gap report now reflects what people actually typed into the box,
 which is the loop finally closing.
 
+![the same two queries, live: the API-key question answers with three citations and a confidence badge; the out-of-scope sourdough question abstains with zero sources](docs/ui.gif)
+
+Those two rows, live — the whole pitch in one loop: it answers *with* citations and a confidence
+badge when the docs support it, and it *abstains* (no sources, confidence 0.000) when they don't.
+
 **Trade-off / what it does _not_ do.** Keyless, "streaming" is honest-but-cosmetic: the transport
 is SSE, but a stranger sees the whole extractive answer paint at once, because there are no
 provider tokens to stream. Real token streaming needs `LLM_PROVIDER=gemini`/`openai`, which I
