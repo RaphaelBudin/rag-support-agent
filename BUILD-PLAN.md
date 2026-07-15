@@ -111,10 +111,31 @@ Repo structure, README-pitch, Docker Compose (pgvector), pyproject, stubs.
 - ✅ *Demo:* `observability.replay` seeds the log → `observability.gap_report` prints the
   themes + cost/latency panel; `--mode semantic` clusters paraphrases by meaning.
 
-## M8 — Thin chat UI + polish
-- Minimal chat interface (streaming, citations, confidence badge, stale flag).
-- Loom demo video (2–3 min) for outreach + interviews.
-- Screenshot/GIF in README.
+## M8 — Thin chat UI + polish ✅
+- ✅ Thin, vanilla chat UI (one HTML/CSS/JS page, no framework, no build step) served by
+  FastAPI, plus `POST /ask` (JSON, the tested data contract) and `GET /ask/stream` (SSE).
+  Renders the confidence badge, citations, a "possibly stale" flag, and a cost/latency footer —
+  all pure *render* of signals the `Answer` already carries (M3–M7). Example chips are verbatim
+  eval-set questions verified against the keyless server (4 answer, 1 abstains structurally).
+- ✅ **Streaming = the keyless-coarse-vs-gated pattern once more:** real token streaming on the
+  gemini/openai path (`generate_content_stream` / `stream=True`); the keyless `extractive` path
+  has no incremental output, so it emits its whole answer as one SSE event. The UI renders
+  incrementally either way and stays 100% keyless.
+- ✅ **Streaming never retracts a token:** the abstention decision is made *before* any token is
+  released — Layer 3 (confidence) is pure over retrieval, Layer 2 (sentinel) is caught by
+  buffering the stream's opening. The streaming `stream_answer` is a pure seam pinned to blocking
+  `build_answer` by a consistency test (the M5 runner-vs-`build_answer` move, reused).
+- ✅ `/ask` + `/ask/stream` pass `record_event=True`, so **live UI traffic feeds the M7
+  blind-spot log** — the gap report now reflects real questions, not just a replayed eval set.
+- ✅ Tests (`tests/test_api.py`, DB-free + key-free): pure serializer, SSE framing, the
+  `stream_answer`↔`build_answer` parity across all abstention layers, and `/health` · `/ask` ·
+  `/ask/stream` via `TestClient` with the pipeline monkeypatched. `pytest` 85 green, `ruff` clean.
+- ✅ **Write-up (README design-decisions):** "Thin chat UI: streaming as the keyless-coarse-vs-
+  gated pattern, one last time" — measured over the live keyless server, with the honest limits
+  (keyless streaming is cosmetic; the confidence layer stays muted under `hash`).
+- *Demo:* `python -m rag_support_agent.api.server` → open http://localhost:8000 (keyless).
+- ⏳ **Manual assets remaining** (the only things left for "portfolio-ready"): the README
+  screenshot/GIF (`docs/ui.png`, instructions in `docs/README.md`) and the 2–3 min Loom video.
 
 ---
 

@@ -32,11 +32,18 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from datetime import datetime
 
 from rag_support_agent.config import Settings, get_settings
 from rag_support_agent.eval.cost import TokenUsage, estimate_cost_usd
-from rag_support_agent.generation.generators import Generator, get_generator, parse_citations
+from rag_support_agent.generation.generators import (
+    INSUFFICIENT_CONTEXT_MESSAGE,
+    SENTINEL,
+    Generator,
+    get_generator,
+    parse_citations,
+)
 from rag_support_agent.knowledge.freshness import assess_freshness
 from rag_support_agent.knowledge.models import (
     Answer,
@@ -156,6 +163,25 @@ def _stale_cited_sources(
     return [src for src in report.stale_sources if src in shown]
 
 
+def _citations_from(text: str, results: list[RetrievalResult]) -> list[Citation]:
+    """Citation list from the ``[n]`` markers actually present in ``text``, ascending.
+
+    Each ``Citation`` keeps its *true* marker (so a prose ``[4]`` renders as ``[4]`` in the
+    list, not a re-enumerated ``[2]``). Shared by ``build_answer`` and ``stream_answer`` so the
+    blocking and streaming seams build citations byte-identically — they cannot drift.
+    """
+    cited = sorted(parse_citations(text, n=len(results)))
+    return [
+        Citation(
+            index=i,
+            knowledge_unit_id=results[i - 1].unit.id,
+            source_uri=results[i - 1].unit.source_uri,
+            score=results[i - 1].score,
+        )
+        for i in cited
+    ]
+
+
 def build_answer(
     query: str,
     results: list[RetrievalResult],
@@ -192,21 +218,85 @@ def build_answer(
     if confidence < s.confidence_abstain_threshold:
         return _abstain(_low_confidence_message(results), latency_ms, confidence)
 
-    # Ascending marker order for the citation list (footnote convention); each Citation
-    # keeps its true marker so [4] in the prose renders as [4] in the list, not [2].
-    cited = sorted(parse_citations(gen.text, n=len(results)))
-    citations = [
-        Citation(
-            index=i,
-            knowledge_unit_id=results[i - 1].unit.id,
-            source_uri=results[i - 1].unit.source_uri,
-            score=results[i - 1].score,
-        )
-        for i in cited
-    ]
+    citations = _citations_from(gen.text, results)
     return Answer(
         verdict=AnswerVerdict.ANSWERED,
         text=gen.text,
+        confidence=confidence,
+        citations=citations,
+        stale_sources=_stale_cited_sources(results, citations, s, now),
+        latency_ms=latency_ms,
+    )
+
+
+def stream_answer(
+    query: str,
+    results: list[RetrievalResult],
+    generator: Generator,
+    settings: Settings | None = None,
+    now: datetime | None = None,
+) -> Iterator[str | Answer]:
+    """Streaming twin of ``build_answer`` — pure (no DB). Yields answer *text chunks* as they
+    arrive, then exactly one final ``Answer`` carrying the trust signals.
+
+    The abstention decision is made *without ever emitting a chunk we would have to retract*:
+
+      - Layer 1 (empty retrieval): short-circuit before the generator is touched.
+      - Layer 2 (the generator's sentinel refusal): detected by buffering just the *opening*
+        of the stream (up to the sentinel's length) before deciding — preserving
+        ``build_answer``'s precedence, where the sentinel is checked before confidence.
+      - Layer 3 (confidence): a pure function of ``results`` (retrieval spread), so it gates
+        before any chunk is released too.
+
+    Only past all three does a text chunk reach the caller, and the final ``Answer`` is built
+    from the *same* helpers ``build_answer`` uses (``compute_confidence``, ``_citations_from``,
+    ``_stale_cited_sources``), so the blocking and streaming seams cannot diverge — pinned by
+    a consistency test the way M5 pins its eval runner to ``build_answer``.
+    """
+    s = settings or get_settings()
+    if not results:
+        yield _abstain(NO_SOURCE_MESSAGE)
+        return
+
+    started = time.perf_counter()
+    stream = generator.stream(query, results)
+    # Buffer only the opening — enough to recognize a sentinel refusal (Layer 2) — before we
+    # release anything, so a refused answer never flashes tokens on screen.
+    buffer = ""
+    exhausted = True
+    for chunk in stream:
+        buffer += chunk
+        if len(buffer) >= len(SENTINEL):
+            exhausted = False
+            break
+
+    # Layer 2 — synthesis grounding: the generator refused (sentinel) or produced nothing.
+    if not buffer.strip() or buffer.strip().startswith(SENTINEL):
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        yield _abstain(INSUFFICIENT_CONTEXT_MESSAGE, latency_ms)
+        return
+
+    # Layer 3 — confidence (M4): pure over ``results``, so gate before emitting a chunk.
+    confidence = compute_confidence(query, results)
+    if confidence < s.confidence_abstain_threshold:
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        yield _abstain(_low_confidence_message(results), latency_ms, confidence)
+        return
+
+    # Answered: release the buffered opening, then the remainder of the stream.
+    parts = [buffer]
+    yield buffer
+    if not exhausted:
+        for chunk in stream:
+            parts.append(chunk)
+            yield chunk
+    full_text = "".join(parts)
+    latency_ms = (time.perf_counter() - started) * 1000.0
+
+    citations = _citations_from(full_text, results)
+    yield Answer(
+        verdict=AnswerVerdict.ANSWERED,
+        text=full_text,
         confidence=confidence,
         citations=citations,
         stale_sources=_stale_cited_sources(results, citations, s, now),
@@ -300,3 +390,53 @@ def answer_question(
         except Exception as exc:  # telemetry must never fail a user's answer
             logger.warning("query-event logging failed: %s", exc)
     return answer
+
+
+def answer_question_stream(
+    query: str,
+    top_k: int | None = None,
+    generator: Generator | None = None,
+    settings: Settings | None = None,
+    record_event: bool = False,
+) -> Iterator[tuple[str, str] | tuple[str, Answer]]:
+    """End-to-end streaming twin of ``answer_question``.
+
+    Yields ``("token", chunk)`` events as the answer streams, then a final ``("answer", Answer)``
+    with cost priced on. The only DB-touching step is ``retrieve``; everything after it is the
+    pure ``stream_answer``. Like ``answer_question`` it prices this query's generation tokens
+    onto ``Answer.cost_usd`` (cross-provider; $0 keyless) and — only when ``record_event`` is
+    set — appends a ``QueryEvent`` to the blind-spot log (opt-in, fail-soft). The logged latency
+    is end-to-end (retrieve → last chunk), so live UI traffic feeds the M7 gap report exactly as
+    the ``ask`` CLI does.
+    """
+    s = settings or get_settings()
+    started = time.perf_counter()
+    results = retrieve(query, top_k=top_k, settings=s)
+    gen = generator or get_generator(s)
+    # Reset per-call token counters so cost reflects *this* query even on a reused generator
+    # (an abstain that never streams would otherwise leak a previous call's counts into cost).
+    for attr in ("last_input_tokens", "last_output_tokens"):
+        if hasattr(gen, attr):
+            setattr(gen, attr, 0)
+
+    answer: Answer | None = None
+    for item in stream_answer(query, results, gen, settings=s):
+        if isinstance(item, Answer):
+            answer = item
+        else:
+            yield ("token", item)
+    assert answer is not None  # stream_answer always yields exactly one Answer
+
+    usage = TokenUsage(
+        input_tokens=getattr(gen, "last_input_tokens", 0),
+        output_tokens=getattr(gen, "last_output_tokens", 0),
+    )
+    answer.cost_usd = _generation_cost(usage, gen)
+    latency_ms = (time.perf_counter() - started) * 1000.0
+
+    if record_event:
+        try:
+            _record_event(query, answer, results, usage, latency_ms, s)
+        except Exception as exc:  # telemetry must never fail a user's answer
+            logger.warning("query-event logging failed: %s", exc)
+    yield ("answer", answer)

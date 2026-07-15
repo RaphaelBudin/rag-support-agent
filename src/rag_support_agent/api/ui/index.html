@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RAG Support Agent</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --ink: #1a1d21;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --accent: #4f46e5;
+    --accent-soft: #eef2ff;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --warn-soft: #fef3c7;
+    --shadow: 0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.06);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 64px; }
+  header h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -.01em; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  .keyless { margin-top: 10px; font-size: 12.5px; color: var(--muted); }
+  .keyless code { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+
+  form { display: flex; gap: 8px; margin: 22px 0 12px; }
+  #q {
+    flex: 1; padding: 12px 14px; font-size: 15px; color: var(--ink);
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px; outline: none;
+    box-shadow: var(--shadow);
+  }
+  #q:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  button.ask {
+    padding: 0 18px; font-size: 15px; font-weight: 600; color: #fff; background: var(--accent);
+    border: 0; border-radius: 10px; cursor: pointer; transition: background .15s;
+  }
+  button.ask:hover { background: #4338ca; }
+  button.ask:disabled { opacity: .55; cursor: default; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 26px; }
+  .chip {
+    font-size: 12.5px; color: #374151; background: var(--card); border: 1px solid var(--line);
+    border-radius: 999px; padding: 6px 12px; cursor: pointer; transition: all .12s;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: var(--shadow); padding: 20px 22px; display: none;
+  }
+  .card.show { display: block; }
+
+  .status { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .pill {
+    font-size: 12px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+    padding: 4px 10px; border-radius: 999px;
+  }
+  .pill.answered { color: var(--ok); background: #dcfce7; }
+  .pill.abstained { color: var(--warn); background: var(--warn-soft); }
+  .conf { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+  .meter { width: 90px; height: 6px; background: var(--line); border-radius: 999px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0; border-radius: 999px; transition: width .3s; }
+  .meter > i.answered { background: var(--ok); }
+  .meter > i.abstained { background: var(--warn); }
+
+  .answer { white-space: pre-wrap; word-wrap: break-word; font-size: 14.5px; margin: 0; }
+  .answer .cite { color: var(--accent); font-weight: 600; }
+  .thinking { color: var(--muted); font-style: italic; }
+  .thinking::after { content: "▋"; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .stale {
+    margin-top: 14px; padding: 9px 12px; font-size: 13px; color: #92400e;
+    background: var(--warn-soft); border-radius: 9px;
+  }
+  .stale b { font-weight: 600; }
+
+  .sources { margin-top: 16px; }
+  .sources h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  .src { display: flex; align-items: baseline; gap: 8px; font-size: 13px; padding: 3px 0; }
+  .src .n { color: var(--accent); font-weight: 700; min-width: 22px; }
+  .src .score { margin-left: auto; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+  .foot {
+    margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line);
+    display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .foot .k { color: #374151; font-weight: 600; }
+  .err { color: #b91c1c; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>RAG Support Agent</h1>
+    <p>Answers support questions from the docs — and knows when <em>not</em> to answer.</p>
+    <div class="keyless">Runs keyless out of the box — the default <code>extractive</code> generator needs no API key.</div>
+  </header>
+
+  <form id="form" autocomplete="off">
+    <input id="q" name="q" placeholder="Ask a question about the docs…" aria-label="Question" />
+    <button class="ask" type="submit">Ask</button>
+  </form>
+
+  <div class="chips" id="chips"></div>
+
+  <div class="card" id="card">
+    <div class="status" id="status"></div>
+    <p class="answer" id="answer"></p>
+    <div id="stale"></div>
+    <div id="sources"></div>
+    <div id="foot"></div>
+  </div>
+</div>
+
+<script>
+  // Example questions — all verbatim from the synthetic eval set. The verdicts noted are the
+  // KEYLESS (hash embedder) behaviour a first-time visitor sees: four answer with a range of
+  // confidence, and the out-of-scope one abstains structurally. (Under a semantic embedder,
+  // ambiguous questions abstain too, via the confidence layer — see the README write-up.)
+  const EXAMPLES = [
+    "How do I rotate an API key?",                             // answered
+    "What does error E_RATE_LIMIT mean and how do I fix it?",  // answered (multi-source)
+    "How long do session tokens stay valid?",                  // answered (high confidence)
+    "What prefix do test API keys use?",                       // answered
+    "How do I bake sourdough bread?",                          // out of scope -> abstains
+  ];
+
+  const form = document.getElementById("form");
+  const qEl = document.getElementById("q");
+  const btn = form.querySelector("button.ask");
+  const card = document.getElementById("card");
+  const statusEl = document.getElementById("status");
+  const answerEl = document.getElementById("answer");
+  const staleEl = document.getElementById("stale");
+  const sourcesEl = document.getElementById("sources");
+  const footEl = document.getElementById("foot");
+
+  const chipsEl = document.getElementById("chips");
+  EXAMPLES.forEach(function (ex) {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.type = "button";
+    b.textContent = ex;
+    b.addEventListener("click", function () { qEl.value = ex; ask(ex); });
+    chipsEl.appendChild(b);
+  });
+
+  function esc(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  // Escape first, THEN dress the [n] citation markers — safe because escaping already ran.
+  function renderBody(text) {
+    return esc(text).replace(/\[(\d+)\]/g, '<span class="cite">[$1]</span>');
+  }
+
+  let currentES = null;
+
+  function ask(query) {
+    query = (query || "").trim();
+    if (!query) return;
+    if (currentES) { currentES.close(); currentES = null; }
+
+    btn.disabled = true;
+    card.classList.add("show");
+    statusEl.innerHTML = '<span class="pill abstained" style="background:#eef2ff;color:#4f46e5">thinking</span>';
+    answerEl.innerHTML = '<span class="thinking">retrieving &amp; grounding</span>';
+    staleEl.innerHTML = "";
+    sourcesEl.innerHTML = "";
+    footEl.innerHTML = "";
+
+    const es = new EventSource("/ask/stream?q=" + encodeURIComponent(query));
+    currentES = es;
+    let text = "";
+    let streaming = false;
+
+    es.addEventListener("token", function (e) {
+      const d = JSON.parse(e.data);
+      if (!streaming) { streaming = true; answerEl.innerHTML = ""; }
+      text += d.text;
+      answerEl.innerHTML = renderBody(text);
+    });
+
+    es.addEventListener("done", function (e) {
+      renderFinal(JSON.parse(e.data));
+      es.close(); currentES = null; btn.disabled = false;
+    });
+
+    es.addEventListener("error", function (e) {
+      // Our terminal error frame carries data; a transport drop does not.
+      let msg = "Couldn't reach the server. Is it running (python -m rag_support_agent.api.server)?";
+      if (e.data) { try { msg = JSON.parse(e.data).message || msg; } catch (_) {} }
+      statusEl.innerHTML = '<span class="pill abstained">error</span>';
+      answerEl.innerHTML = '<span class="err">' + esc(msg) + "</span>";
+      es.close(); currentES = null; btn.disabled = false;
+    });
+  }
+
+  function renderFinal(a) {
+    const answered = a.verdict === "answered";
+    const cls = answered ? "answered" : "abstained";
+    // Confidence is a retrieval-spread signal in ~[0, 0.3]; scale the meter against ~0.4 so a
+    // clear winner reads near-full while the abstain band (< 0.12) reads low. The number is the
+    // source of truth; the bar is just a glance.
+    const pct = Math.max(0, Math.min(100, (a.confidence / 0.4) * 100));
+    statusEl.innerHTML =
+      '<span class="pill ' + cls + '">' + a.verdict + "</span>" +
+      '<span class="conf">confidence ' + a.confidence.toFixed(3) +
+      '<span class="meter"><i class="' + cls + '" style="width:' + pct + '%"></i></span>' +
+      '<span title="abstains below the calibrated threshold">· abstains &lt; 0.12</span></span>';
+
+    answerEl.innerHTML = renderBody(a.text);
+
+    staleEl.innerHTML = "";
+    if (a.stale_sources && a.stale_sources.length) {
+      staleEl.innerHTML =
+        '<div class="stale">⚠ <b>possibly stale</b> — age is a decay-risk proxy, not a verdict; ' +
+        "re-verify: " + a.stale_sources.map(esc).join(", ") + "</div>";
+    }
+
+    sourcesEl.innerHTML = "";
+    if (answered && a.citations && a.citations.length) {
+      let html = '<div class="sources"><h3>Sources</h3>';
+      a.citations.forEach(function (c) {
+        html +=
+          '<div class="src"><span class="n">[' + c.index + "]</span>" +
+          "<span>" + esc(c.source_uri) + "</span>" +
+          '<span class="score">rrf ' + c.score.toFixed(4) + "</span></div>";
+      });
+      sourcesEl.innerHTML = html + "</div>";
+    }
+
+    const cost = a.cost_usd == null ? "—" : (a.cost_usd === 0 ? "$0.00" : "$" + a.cost_usd.toFixed(6));
+    const lat = a.latency_ms == null ? "—" : Math.round(a.latency_ms) + " ms";
+    footEl.className = "foot";
+    footEl.innerHTML =
+      '<span><span class="k">latency</span> ' + lat + "</span>" +
+      '<span><span class="k">cost</span> ' + cost + "</span>" +
+      '<span><span class="k">provider</span> ' + esc(a.provider) + "</span>";
+  }
+
+  form.addEventListener("submit", function (e) { e.preventDefault(); ask(qEl.value); });
+  qEl.focus();
+</script>
+</body>
+</html>

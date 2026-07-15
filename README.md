@@ -21,6 +21,7 @@ The hard part of RAG in production isn't retrieval — it's everything around it
 | **Blind-spot detection** | Logs low-confidence / unanswered queries into a knowledge-gap report | Tells you exactly what to write next. Closes the loop. |
 | **Hybrid retrieval** | Vector (pgvector) + keyword (BM25) fusion | Pure vector search misses exact-match terms (error codes, API names). |
 | **Cost & latency observability** | Per-request token/cost/latency logging | AI features die in production from silent cost creep. |
+| **Thin chat UI** | One vanilla page: streams the answer, shows the confidence badge, citations, and stale flag | The trust signals are only useful if a human can *see* them; live traffic also feeds the gap report. |
 
 ---
 
@@ -74,9 +75,11 @@ python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"
 # real synthesis instead of verbatim excerpts (needs GEMINI_API_KEY in .env):
 LLM_PROVIDER=gemini python -m rag_support_agent.generation.ask --query "How do I rotate an API key?"
 
-# 6. Run the API + UI  (M8 — not built yet)
+# 6. Run the API + thin chat UI  (M8)
 python -m rag_support_agent.api.server
-# open http://localhost:8000
+# open http://localhost:8000 — ask a question (or click an example chip); the answer streams
+# in with a confidence badge, citations, and a "possibly stale" flag. Runs keyless. Real
+# token streaming turns on with LLM_PROVIDER=gemini / openai.
 
 # 7. Run the eval harness  (M5) — one command → the metrics table
 python -m rag_support_agent.eval.run --dataset evaluation/datasets/support_qa.jsonl --calibrate
@@ -667,6 +670,80 @@ into real shared vocabulary only once a cluster has volume, which is where it ma
 python -m rag_support_agent.observability.replay --dataset evaluation/datasets/support_qa.jsonl --reset
 python -m rag_support_agent.observability.gap_report                              # keyless-lexical + panel
 EMBEDDING_PROVIDER=gemini python -m rag_support_agent.observability.gap_report --mode semantic
+```
+
+### Thin chat UI: streaming as the keyless-coarse-vs-gated pattern, one last time
+
+![chat UI](docs/ui.png)
+
+**Decision.** Ship a single vanilla HTML/CSS/JS page (no framework, no build step) behind two
+FastAPI endpoints: `POST /ask` returns the whole grounded `Answer` as JSON (the tested data
+contract), and `GET /ask/stream` delivers the same answer over Server-Sent Events. Every prior
+milestone *computed* a trust signal — confidence, citations, a stale flag, a per-request cost —
+and left it on the `Answer`. This one is where a human finally *sees* them, and where live UI
+traffic feeds the M7 blind-spot log (`record_event=True`) so the knowledge-gap report closes the
+loop over *real* questions, not just a replayed eval set.
+
+**The honest hard part — there is nothing to stream keyless.** The pipeline is blocking: no
+partial answer exists until `build_answer` finishes, and the keyless `ExtractiveGenerator`
+produces its whole answer in one shot — it *echoes* retrieved passages, so there are no tokens
+to trickle out. Real token streaming lives only behind a provider's streaming API
+(`generate_content_stream` / `stream=True`). So streaming is the same **keyless-coarse vs.
+gated** split every milestone has hit (M2 lexical-vs-semantic retrieval, M6 mtime-vs-real
+timestamp, M7 lexical-vs-semantic clustering): the SSE *transport* is uniform, but
+token-by-token streaming is gated on gemini/openai, and the extractive path degrades to a single
+whole-answer event. The UI renders incrementally either way — and, the point, the repo still
+runs end-to-end for a stranger with no key.
+
+**Challenge — streaming must never retract a token.** Abstention can withhold an answer, and two
+of the three layers traditionally decide *around* generation: the M3 sentinel refusal (Layer 2)
+and the M4 confidence cut (Layer 3). Stream first and abstain second, and the user watches text
+appear only to have it yanked. The fix leans on what each layer actually depends on: **Layer 3 is
+a pure function of retrieval** (the dense-cosine spread — it never needed the drafted text), so
+it gates *before* the first token; and **Layer 2 is caught by buffering just the opening of the
+stream** (up to the sentinel's length) before releasing anything. Only past all three does a
+token reach the browser, so a refused answer never flashes on screen. This kept a discipline the
+repo cares about: the streaming path is a pure `stream_answer` seam that builds its final
+`Answer` from the *same* helpers as blocking `build_answer` (`compute_confidence`,
+`_citations_from`, `_stale_cited_sources`), pinned by a consistency test — the identical move M5
+used to stop its eval runner drifting from `build_answer`.
+
+**What I measured** (keyless, over the live server — `EMBEDDING_PROVIDER=hash`,
+`LLM_PROVIDER=extractive`):
+
+| Query | Verdict | Confidence | SSE token events |
+|---|---|---|---|
+| `How do I rotate an API key?` | answered | 0.340 | 1 (whole answer) |
+| `How long do session tokens stay valid?` | answered | 0.856 | 1 |
+| `How do I bake sourdough bread?` | **abstained** (structural) | 0.000 | **0** |
+| `How do I verify a webhook signature?` | **abstained** (confidence) | 0.000 | **0** |
+
+The extractive path emits its answer as a single token event, then a `done` event carrying the
+badges; an abstention emits **zero** token events (the decision is made before any release) then
+the `done`. Cost is **$0** at a few ms end-to-end, and every served query is appended to the M7
+`query_events` log — so the gap report now reflects what people actually typed into the box,
+which is the loop finally closing.
+
+**Trade-off / what it does _not_ do.** Keyless, "streaming" is honest-but-cosmetic: the transport
+is SSE, but a stranger sees the whole extractive answer paint at once, because there are no
+provider tokens to stream. Real token streaming needs `LLM_PROVIDER=gemini`/`openai`, which I
+implemented but could only lightly exercise — Gemini's free tier caps `generate_content` at
+20/day and there's no OpenAI key here; what's verified end-to-end is the keyless one-shot path,
+the SSE framing, and the `stream_answer`↔`build_answer` parity. The confidence *meter* is a
+display scaling of the spread signal, not a new measurement. And M4's honest limit is visible
+right in the demo: under the `hash` embedder the confidence layer is muted, so an ambiguous
+question like *"How do I get started?"* **answers** instead of abstaining — that separation only
+appears under a semantic embedder. The UI is deliberately thin — one page, one input, no auth, no
+rate limit, single user — and it inherits M7's privacy note: logging real user queries is
+PII-sensitive, and the `query_events` schema is where a retention/redaction policy would live.
+(One gotcha caught here: with `from __future__ import annotations`, a Pydantic request model
+defined *inside* the app factory is an unresolvable forward-ref for FastAPI's `get_type_hints`,
+which then silently reinterprets the body as query params — the model has to live at module
+scope.)
+
+```
+python -m rag_support_agent.api.server                       # keyless; open http://localhost:8000
+LLM_PROVIDER=gemini python -m rag_support_agent.api.server   # real token streaming (respects the 20/day cap)
 ```
 
 ### Self-hosted pgvector vs a managed vector DB (cost/control trade-off) — _tbd_

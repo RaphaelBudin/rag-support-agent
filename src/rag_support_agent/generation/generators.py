@@ -25,6 +25,7 @@ any generator's output into a citation list without knowing which generator ran.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -90,6 +91,16 @@ def parse_citations(text: str, n: int) -> list[int]:
 class Generator(Protocol):
     def generate(self, query: str, results: list[RetrievalResult]) -> GenResult: ...
 
+    def stream(self, query: str, results: list[RetrievalResult]) -> Iterator[str]:
+        """Yield the answer text incrementally (raw, un-post-processed).
+
+        The streaming twin of ``generate``: the caller (``answer.stream_answer``) recognizes
+        a sentinel refusal from the streamed text and builds the citation list from the
+        accumulated whole, so ``stream`` deliberately yields the model's raw tokens — it does
+        *not* itself substitute the refusal message the way ``generate`` does.
+        """
+        ...
+
 
 class ExtractiveGenerator:
     """Keyless default: echo the top retrieved passages verbatim, each ``[n]``-tagged.
@@ -117,6 +128,13 @@ class ExtractiveGenerator:
             lines.append(f"  [{i}] {label}")
         return GenResult(text="\n".join(lines).strip())
 
+    def stream(self, query: str, results: list[RetrievalResult]) -> Iterator[str]:
+        """The extractive path has no incremental output — it echoes whole retrieved passages
+        — so it yields its entire answer as a single chunk. That is the honest keyless end of
+        the SSE contract: there are no provider tokens to stream, and the answer is grounded by
+        construction regardless, so the UI simply renders it in one paint."""
+        yield self.generate(query, results).text
+
 
 _GROUNDING_INSTRUCTION = (
     "You are a support assistant. Answer the user's question using ONLY the numbered "
@@ -126,6 +144,14 @@ _GROUNDING_INSTRUCTION = (
     f"- If the context does not contain enough information to answer, reply with exactly: {SENTINEL}\n"
     "- Be concise and specific; do not add information that is not in the context."
 )
+
+
+def _grounded_prompt(query: str, results: list[RetrievalResult]) -> str:
+    """The single grounding prompt both real generators (and both their call styles) share."""
+    return (
+        f"{_GROUNDING_INSTRUCTION}\n\nContext:\n{format_context(results)}\n\n"
+        f"Question: {query}\n\nAnswer:"
+    )
 
 
 class GeminiGenerator:
@@ -150,20 +176,19 @@ class GeminiGenerator:
         self.last_input_tokens = 0
         self.last_output_tokens = 0
 
-    def generate(self, query: str, results: list[RetrievalResult]) -> GenResult:
+    def _config(self):
         from google.genai import types
 
-        prompt = (
-            f"{_GROUNDING_INSTRUCTION}\n\nContext:\n{format_context(results)}\n\n"
-            f"Question: {query}\n\nAnswer:"
+        return types.GenerateContentConfig(
+            temperature=self.temperature,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
+
+    def generate(self, query: str, results: list[RetrievalResult]) -> GenResult:
         resp = self._client.models.generate_content(
             model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=self.temperature,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
+            contents=_grounded_prompt(query, results),
+            config=self._config(),
         )
         self.last_input_tokens = getattr(resp.usage_metadata, "prompt_token_count", 0) or 0
         self.last_output_tokens = getattr(resp.usage_metadata, "candidates_token_count", 0) or 0
@@ -172,6 +197,24 @@ class GeminiGenerator:
         if not text or text.startswith(SENTINEL):
             return GenResult(text=INSUFFICIENT_CONTEXT_MESSAGE, abstained=True)
         return GenResult(text=text)
+
+    def stream(self, query: str, results: list[RetrievalResult]) -> Iterator[str]:
+        """Real token streaming via ``generate_content_stream``. Yields each chunk's text as it
+        arrives and records the final usage counts (Gemini reports them on the trailing chunk),
+        so cost is still priced exactly as on the non-streaming path."""
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        for chunk in self._client.models.generate_content_stream(
+            model=self.model,
+            contents=_grounded_prompt(query, results),
+            config=self._config(),
+        ):
+            usage = getattr(chunk, "usage_metadata", None)
+            if usage is not None:
+                self.last_input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                self.last_output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+            if chunk.text:
+                yield chunk.text
 
 
 class OpenAIGenerator:
@@ -198,14 +241,10 @@ class OpenAIGenerator:
         self.last_output_tokens = 0
 
     def generate(self, query: str, results: list[RetrievalResult]) -> GenResult:
-        prompt = (
-            f"{_GROUNDING_INSTRUCTION}\n\nContext:\n{format_context(results)}\n\n"
-            f"Question: {query}\n\nAnswer:"
-        )
         resp = self._client.chat.completions.create(
             model=self.model,
             temperature=self.temperature,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": _grounded_prompt(query, results)}],
         )
         usage = resp.usage
         self.last_input_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -215,6 +254,28 @@ class OpenAIGenerator:
         if not text or text.startswith(SENTINEL):
             return GenResult(text=INSUFFICIENT_CONTEXT_MESSAGE, abstained=True)
         return GenResult(text=text)
+
+    def stream(self, query: str, results: list[RetrievalResult]) -> Iterator[str]:
+        """Real token streaming via chat completions with ``stream=True``. ``include_usage``
+        asks OpenAI for a trailing usage-only chunk so cost is priced identically to the
+        non-streaming path."""
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        for chunk in self._client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            messages=[{"role": "user", "content": _grounded_prompt(query, results)}],
+            stream=True,
+            stream_options={"include_usage": True},
+        ):
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                self.last_input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                self.last_output_tokens = getattr(usage, "completion_tokens", 0) or 0
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
 
 
 def get_generator(settings: Settings | None = None) -> Generator:
